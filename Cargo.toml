@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["crates/bitplane-sessiond"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Denis Homolík"]
+repository = "https://github.com/bp-bitplane/bitplane-sessiond"
