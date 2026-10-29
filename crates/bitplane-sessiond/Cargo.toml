@@ -1,0 +1,23 @@
+[package]
+name = "bitplane-sessiond"
+description = "The bitplane daemon: one per host, owning its sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "e52977dfee2b80b0a06c19c1949ddcc25becdca7" }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
