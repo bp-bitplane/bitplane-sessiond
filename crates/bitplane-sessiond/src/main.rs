@@ -42,6 +42,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DevCommand {
+    /// Print the daemon's hello reply.
+    Hello,
     /// Call one method and print its result.
     Call {
         method: String,
@@ -101,8 +103,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None if no_start => Client::connect(&Dirs::for_host()?.socket()).await?,
                 None => connect_or_start(&Dirs::for_host()?, &std::env::current_exe()?).await?,
             };
-            client.hello("bitplane-sessiond dev").await?;
+            let hello = client.hello("bitplane-sessiond dev").await?;
             match command {
+                DevCommand::Hello => println!("{}", serde_json::to_string_pretty(&hello)?),
                 DevCommand::Call { method, params } => {
                     let params = params.map(|text| serde_json::from_str(&text)).transpose()?;
                     let result = client.call(&method, params).await?;
