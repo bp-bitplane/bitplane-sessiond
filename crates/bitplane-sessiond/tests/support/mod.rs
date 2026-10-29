@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bitplane_protocol::RpcError;
 use bitplane_sessiond::client::Client;
+use bitplane_sessiond::env::EnvMap;
 use bitplane_sessiond::module::{Availability, BoxFuture, Call, Module};
 use bitplane_sessiond::paths::Dirs;
 use bitplane_sessiond::server::{Config, ServeError, serve};
@@ -28,6 +29,14 @@ impl TestDaemon {
     }
 
     pub async fn start_with(modules: Vec<Arc<dyn Module>>, peer_uid: u32) -> Self {
+        Self::start_full(modules, peer_uid, EnvMap::new()).await
+    }
+
+    pub async fn start_with_env(modules: Vec<Arc<dyn Module>>, env: EnvMap) -> Self {
+        Self::start_full(modules, own_uid(), env).await
+    }
+
+    async fn start_full(modules: Vec<Arc<dyn Module>>, peer_uid: u32, env: EnvMap) -> Self {
         // Short paths: macOS caps a socket path at 104 bytes.
         let root = tempfile::Builder::new()
             .prefix("sd")
@@ -37,7 +46,7 @@ impl TestDaemon {
             runtime: root.path().join("run"),
             state: root.path().join("state"),
         };
-        let daemon = Self::serve(dirs, root, modules, peer_uid);
+        let daemon = Self::serve(dirs, root, modules, peer_uid, env);
         daemon.wait_for_socket().await;
         daemon
     }
@@ -49,6 +58,7 @@ impl TestDaemon {
             listener: None,
             peer_uid: own_uid(),
             modules: vec![],
+            env: Some(EnvMap::new()),
         };
         serve(config, std::future::pending()).await
     }
@@ -73,6 +83,7 @@ impl TestDaemon {
         root: tempfile::TempDir,
         modules: Vec<Arc<dyn Module>>,
         peer_uid: u32,
+        env: EnvMap,
     ) -> Self {
         let (stop, stopped) = oneshot::channel::<()>();
         let config = Config {
@@ -80,6 +91,7 @@ impl TestDaemon {
             listener: None,
             peer_uid,
             modules,
+            env: Some(env),
         };
         let task = tokio::spawn(serve(config, async move {
             let _ = stopped.await;
@@ -143,7 +155,7 @@ impl Module for Echo {
         self.dependencies
     }
 
-    fn probe(&self) -> Availability {
+    fn probe(&self, _env: &EnvMap) -> Availability {
         self.availability.clone()
     }
 

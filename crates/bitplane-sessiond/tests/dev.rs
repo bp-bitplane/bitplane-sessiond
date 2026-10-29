@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use bitplane_protocol::{Frame, RpcError};
 use bitplane_sessiond::dev::{self, DETACH};
+use bitplane_sessiond::env::EnvMap;
 use bitplane_sessiond::module::{Availability, BoxFuture, Call, Connection, Module, ModuleContext};
 use serde_json::{Value, json};
 use support::TestDaemon;
@@ -77,7 +78,7 @@ impl Module for StubSessions {
         "session"
     }
 
-    fn probe(&self) -> Availability {
+    fn probe(&self, _env: &EnvMap) -> Availability {
         Availability::Available { info: None }
     }
 

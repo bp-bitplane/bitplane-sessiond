@@ -12,6 +12,8 @@ use bitplane_protocol::{Capability, ErrorCode, Frame, Notification, RpcError};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::env::EnvMap;
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug, Clone)]
@@ -28,7 +30,9 @@ pub trait Module: Send + Sync + 'static {
         &[]
     }
 
-    fn probe(&self) -> Availability;
+    /// `env` is the login-shell environment, so tools are looked up on the
+    /// user's own `PATH`.
+    fn probe(&self, env: &EnvMap) -> Availability;
 
     /// Called once, after probing, on available modules only.
     fn start(&self, _context: ModuleContext) {}
@@ -55,6 +59,9 @@ pub struct Connection {
 pub struct ModuleContext {
     /// `<state>/<namespace>/`, created before `start`.
     pub state_dir: std::path::PathBuf,
+    /// The login-shell environment captured at startup; what sessions and
+    /// tools are spawned with.
+    pub env: Arc<EnvMap>,
     pub events: Events,
     pub bus: Bus,
 }
@@ -99,12 +106,13 @@ impl Registry {
     pub fn start(
         modules: Vec<Arc<dyn Module>>,
         state_dir: &Path,
+        env: Arc<EnvMap>,
         events: Events,
     ) -> std::io::Result<Self> {
         let bus = Bus(broadcast::channel(256).0);
         let mut availability: HashMap<&'static str, Availability> = modules
             .iter()
-            .map(|module| (module.namespace(), module.probe()))
+            .map(|module| (module.namespace(), module.probe(&env)))
             .collect();
         resolve_dependencies(&modules, &mut availability);
 
@@ -118,6 +126,7 @@ impl Registry {
                 std::fs::create_dir_all(&state_dir)?;
                 module.start(ModuleContext {
                     state_dir,
+                    env: env.clone(),
                     events: events.clone(),
                     bus: bus.clone(),
                 });

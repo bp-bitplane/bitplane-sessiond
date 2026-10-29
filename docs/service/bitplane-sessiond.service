@@ -1,0 +1,6 @@
+[Unit]
+Description=bitplane session daemon, protocol v1
+Requires=bitplane-sessiond.socket
+
+[Service]
+ExecStart=%h/.local/bin/bitplane-sessiond serve
