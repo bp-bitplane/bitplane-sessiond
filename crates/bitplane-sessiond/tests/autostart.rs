@@ -47,6 +47,25 @@ async fn racing_starters_end_up_on_one_daemon() {
     assert_eq!(a.unwrap().daemon.instance, b.unwrap().daemon.instance);
 }
 
+#[test]
+fn dev_hello_starts_a_daemon_from_the_host_environment() {
+    let host = Host::new();
+
+    let output = std::process::Command::new(EXE)
+        .args(["dev", "hello"])
+        .env_remove("TMPDIR")
+        .env("XDG_RUNTIME_DIR", host.base.join("run"))
+        .env("XDG_STATE_HOME", host.base.join("state"))
+        .env("SHELL", "/bin/sh")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let hello: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(hello["daemon"]["name"], "bitplane-sessiond");
+    assert!(host.dirs.socket().exists());
+}
+
 #[tokio::test]
 async fn a_stale_socket_is_replaced() {
     let host = Host::new();
@@ -55,7 +74,8 @@ async fn a_stale_socket_is_replaced() {
         .mode(0o700)
         .create(&host.dirs.runtime)
         .unwrap();
-    drop(std::os::unix::net::UnixListener::bind(host.dirs.socket()).unwrap());
+    // Never listens, so a concurrent test's fork that inherits it can't accept.
+    drop(std::os::unix::net::UnixDatagram::bind(host.dirs.socket()).unwrap());
     assert!(Client::connect(&host.dirs.socket()).await.is_err());
 
     let client = connect_or_start(&host.dirs, Path::new(EXE)).await.unwrap();
@@ -119,17 +139,16 @@ async fn serve_accepts_a_socket_activated_listener() {
 /// while it still holds the lock, so a recycled pid is never signalled.
 struct Host {
     dirs: Dirs,
+    base: std::path::PathBuf,
     _root: tempfile::TempDir,
 }
 
 impl Host {
     fn new() -> Self {
-        let (root, path) = short_tempdir();
+        let (root, base) = short_tempdir();
         Self {
-            dirs: Dirs {
-                runtime: path.join("run"),
-                state: path.join("state"),
-            },
+            dirs: Dirs::for_version(&base.join("run"), &base.join("state")),
+            base,
             _root: root,
         }
     }
