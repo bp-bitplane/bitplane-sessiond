@@ -146,7 +146,8 @@ mod tests {
         let shell = dir.path().join("login-shell");
         std::fs::write(
             &shell,
-            "#!/bin/sh\nexport FROM_PROFILE=yes\nexec /bin/sh \"$@\"\n",
+            // Runs the `-c` script itself, so the host's profile files stay out.
+            "#!/bin/sh\n[ \"$1 $2 $3\" = \"-l -i -c\" ] || exit 2\nexport FROM_PROFILE=yes\neval \"$4\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
