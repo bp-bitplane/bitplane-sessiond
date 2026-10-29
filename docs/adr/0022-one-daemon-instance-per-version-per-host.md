@@ -11,7 +11,7 @@ A host runs one **daemon instance** of `bitplane-sessiond serve` per protocol ve
 
 **Every connection is checked.** The socket sits in a `0700` directory, and on accept the daemon compares the peer's uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) with its own and closes the connection on a mismatch, before reading a byte. Every connection that passes is fully trusted, as ADR 0020 makes the host the isolation boundary.
 
-**Start.** When `LISTEN_FDS` is set the daemon takes its socket from systemd or launchd. Otherwise a client starts it on demand: dial the version's socket; on no answer remove the stale socket, run `serve` detached (`setsid`, stdio to the log file) and poll with backoff for about 5 s. cc does this with the daemon it ships as a Tauri sidecar. In M1 the systemd and launchd units are documented templates, not an installer.
+**Start.** When `LISTEN_FDS` is set the daemon takes its socket from systemd or launchd. Otherwise a client starts it on demand: dial the version's socket; on no answer run `serve` detached (`setsid`, stdio to `sessiond.log` in the state directory) and poll with backoff for about 5 s. The client never removes the socket, since a racing starter's daemon may have just bound it. `serve` removes a stale one once it holds the lock. The daemon then captures the login-shell environment once, however it was started. cc does this with the daemon it ships as a Tauri sidecar. In M1 the systemd and launchd units are documented templates, not an installer.
 
 ## Considered Options
 

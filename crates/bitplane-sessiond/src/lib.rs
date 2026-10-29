@@ -1,6 +1,8 @@
+pub mod autostart;
 pub mod client;
 pub mod connection;
 pub mod dev;
+pub mod env;
 pub mod module;
 pub mod paths;
 pub mod pidfile;

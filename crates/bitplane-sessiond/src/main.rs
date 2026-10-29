@@ -2,6 +2,7 @@ use std::os::fd::{AsFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use bitplane_sessiond::autostart::connect_or_start;
 use bitplane_sessiond::client::Client;
 use bitplane_sessiond::paths::Dirs;
 use bitplane_sessiond::server::{Config, serve};
@@ -28,9 +29,12 @@ enum Command {
     },
     /// Talk to a running daemon by hand.
     Dev {
-        /// Overrides the socket path.
+        /// Connects to this socket instead, and never starts a daemon.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Fails instead of starting a daemon when none is running.
+        #[arg(long)]
+        no_start: bool,
         #[command(subcommand)]
         command: DevCommand,
     },
@@ -75,7 +79,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             runtime_dir,
             state_dir,
         } => {
-            let mut dirs = default_dirs()?;
+            let mut dirs = Dirs::for_host()?;
             dirs.runtime = runtime_dir.unwrap_or(dirs.runtime);
             dirs.state = state_dir.unwrap_or(dirs.state);
             let config = Config {
@@ -83,15 +87,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 listener: activated_listener(),
                 peer_uid: rustix::process::getuid().as_raw(),
                 modules: Vec::new(),
+                env: None,
             };
             serve(config, shutdown_signal()).await?;
         }
-        Command::Dev { socket, command } => {
-            let socket = match socket {
-                Some(socket) => socket,
-                None => default_dirs()?.socket(),
+        Command::Dev {
+            socket,
+            no_start,
+            command,
+        } => {
+            let mut client = match socket {
+                Some(socket) => Client::connect(&socket).await?,
+                None if no_start => Client::connect(&Dirs::for_host()?.socket()).await?,
+                None => connect_or_start(&Dirs::for_host()?, &std::env::current_exe()?).await?,
             };
-            let mut client = Client::connect(&socket).await?;
             client.hello("bitplane-sessiond dev").await?;
             match command {
                 DevCommand::Call { method, params } => {
@@ -118,21 +127,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-fn default_dirs() -> Result<Dirs, String> {
-    let env = |name| {
-        std::env::var_os(name)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    let runtime = env("XDG_RUNTIME_DIR")
-        .or_else(|| env("TMPDIR"))
-        .ok_or("neither XDG_RUNTIME_DIR nor TMPDIR is set")?;
-    let state = env("XDG_STATE_HOME")
-        .or_else(|| env("HOME").map(|home| home.join(".local/state")))
-        .ok_or("neither XDG_STATE_HOME nor HOME is set")?;
-    Ok(Dirs::for_version(&runtime, &state))
 }
 
 /// Socket activation: systemd passes fd 3 with `LISTEN_PID` set to us.

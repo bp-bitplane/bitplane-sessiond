@@ -82,6 +82,7 @@ version = "0.1.0"
 dependencies = [
  "bitplane-protocol",
  "clap",
+ "libc",
  "rustix",
  "serde",
  "serde_json",

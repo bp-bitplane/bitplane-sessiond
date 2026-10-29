@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use bitplane_protocol::{ErrorCode, RpcError};
 use bitplane_sessiond::client::ClientError;
+use bitplane_sessiond::env::EnvMap;
 use bitplane_sessiond::module::{Availability, BoxFuture, Call, Module, ModuleContext};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
@@ -158,7 +159,7 @@ impl Module for Announcer {
         "announce"
     }
 
-    fn probe(&self) -> Availability {
+    fn probe(&self, _env: &EnvMap) -> Availability {
         Availability::Available { info: None }
     }
 

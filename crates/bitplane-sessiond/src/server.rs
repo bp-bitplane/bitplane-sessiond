@@ -9,6 +9,7 @@ use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
 use crate::connection::{Shared, serve_connection};
+use crate::env::{self, EnvMap};
 use crate::module::{Events, Module, Registry};
 use crate::paths::Dirs;
 use crate::pidfile::{Pidfile, PidfileError};
@@ -21,6 +22,8 @@ pub struct Config {
     /// Connections from any other uid are closed unread (ADR 0022).
     pub peer_uid: u32,
     pub modules: Vec<Arc<dyn Module>>,
+    /// `None` captures the login-shell environment at startup.
+    pub env: Option<EnvMap>,
 }
 
 #[derive(Debug)]
@@ -36,6 +39,7 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
         listener,
         peer_uid,
         modules,
+        env,
     } = config;
     create_private_dir(&dirs.runtime)?;
     create_private_dir(&dirs.state)?;
@@ -65,8 +69,21 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
         }
     };
 
+    // After bind, so a starter's dial succeeds at once while `hello` waits;
+    // before the probes, so they see the user's `PATH`.
+    let env = match env {
+        Some(env) => env,
+        None => {
+            let (env, warning) = env::capture(&env::original(), env::CAPTURE_TIMEOUT).await;
+            if let Some(warning) = warning {
+                tracing::warn!(%warning, "using the daemon's own environment, not the login shell's");
+            }
+            env
+        }
+    };
+
     let events = broadcast::channel(1024).0;
-    let registry = Registry::start(modules, &dirs.state, Events(events.clone()))?;
+    let registry = Registry::start(modules, &dirs.state, Arc::new(env), Events(events.clone()))?;
     let daemon = DaemonInfo {
         name: DAEMON_NAME.into(),
         version: DAEMON_VERSION.into(),
