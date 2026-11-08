@@ -1,9 +1,10 @@
 mod support;
 
-use bitplane_sessiond::client::Client;
 use bitplane_sessiond::session::Sessions;
 use serde_json::{Value, json};
-use support::{Screen, TestDaemon, shell_env};
+use support::{
+    Screen, TestDaemon, next_event, open, paced_lines, sessions_daemon, shell_env, wait_until,
+};
 
 #[tokio::test]
 async fn open_starts_a_shell_in_the_root_with_the_session_env() {
@@ -40,11 +41,6 @@ async fn open_starts_a_shell_in_the_root_with_the_session_env() {
     assert!(uuid::Uuid::parse_str(id).is_ok(), "{id} is a UUID");
     assert_eq!(session["plane"], "web");
     assert_eq!(session["status"], json!({ "state": "running" }));
-}
-
-async fn open(client: &Client, params: Value) -> Value {
-    let result = client.call("session.open", Some(params)).await.unwrap();
-    result["session"].clone()
 }
 
 #[tokio::test]
@@ -109,9 +105,12 @@ async fn attach_during_output_continues_the_stream_with_no_byte_lost_or_repeated
     let mut whole = Screen::attach(&mut early, id).await;
     whole.type_text(
         &early,
-        "sleep 0.3; seq 1 60000 | sed 's/^/line /'; echo done-$((6*7))\r",
+        &format!(
+            "sleep 0.3; {}; echo done-$((6*7))\r",
+            paced_lines("line ", 40)
+        ),
     );
-    whole.wait_for(&mut early, "line 2000\r\n").await;
+    whole.wait_for(&mut early, "line 3 1\r\n").await;
 
     let mut joined = Screen::attach(&mut late, id).await;
     let (_, _) = tokio::join!(
@@ -124,7 +123,7 @@ async fn attach_during_output_continues_the_stream_with_no_byte_lost_or_repeated
     joined.drain(&mut late).await;
 
     assert!(joined.snapshot_offset > whole.snapshot_offset);
-    assert!(!joined.text().starts_with("line 1\r\n"));
+    assert!(!joined.text().starts_with("line 1 1\r\n"));
     let from = (joined.snapshot_offset - whole.snapshot_offset) as usize;
     assert_eq!(joined.next_offset, whole.next_offset);
     assert!(
@@ -194,32 +193,4 @@ async fn output_keeps_flowing_with_no_attachment_and_a_reattach_shows_it() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-}
-
-async fn sessions_daemon() -> (tempfile::TempDir, TestDaemon) {
-    let home = tempfile::tempdir().unwrap();
-    let daemon = TestDaemon::start_with_env(vec![Sessions::module()], shell_env(home.path())).await;
-    (home, daemon)
-}
-
-async fn next_event(client: &mut Client, method: &str) -> Value {
-    loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), client.next_event())
-            .await
-            .unwrap_or_else(|_| panic!("no {method} event"))
-            .expect("connection open");
-        if event.method == method {
-            return event.params.unwrap_or_default();
-        }
-    }
-}
-
-async fn wait_until(done: impl Fn() -> bool) {
-    for _ in 0..500 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("timed out");
 }

@@ -82,7 +82,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "bitplane-protocol"
 version = "0.1.0"
-source = "git+https://github.com/bp-bitplane/bitplane-protocol?rev=003b6cbbede9ac69d7550986ab576118b7f13b66#003b6cbbede9ac69d7550986ab576118b7f13b66"
+source = "git+https://github.com/bp-bitplane/bitplane-protocol?rev=0d20063eb0ec3f8a1b72ac4043dcd2d2251c96c2#0d20063eb0ec3f8a1b72ac4043dcd2d2251c96c2"
 dependencies = [
  "serde",
  "serde_json",

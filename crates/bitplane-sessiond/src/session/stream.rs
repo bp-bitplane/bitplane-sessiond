@@ -19,6 +19,8 @@ use super::spool::{GhosttySpool, Spool};
 pub const WINDOW: u64 = 128 * 1024;
 /// Once the window is full, sending resumes when unacked bytes drop to this.
 pub const LOW_WATER: u64 = 32 * 1024;
+/// Output queued for one attachment past which it is behind (ADR 0026).
+pub const MAX_QUEUE: usize = 256 * 1024;
 /// Largest OUTPUT frame.
 pub const MAX_FRAME: usize = 16 * 1024;
 
@@ -36,7 +38,12 @@ pub enum Command {
         attachment: AttachmentId,
         bytes: u64,
     },
-    Detach(AttachmentId),
+    /// Stops sending to the attachment, then drops `done`, so a reply sent
+    /// after it follows the attachment's last frame.
+    Detach {
+        attachment: AttachmentId,
+        done: oneshot::Sender<()>,
+    },
     Resize(Size),
     /// The session is closed: stop sending to anyone.
     Close,
@@ -61,11 +68,13 @@ struct Stream {
 
 /// One attachment's byte-ack window. `sent` and `acked` count snapshot and
 /// output bytes; `queue` holds output not yet sent, ending at the stream's offset.
+/// A `behind` flow queues nothing and gets a fresh SNAPSHOT on its next ack.
 struct Flow {
     connection: Connection,
     sent: u64,
     acked: u64,
     paused: bool,
+    behind: bool,
     queue: Vec<u8>,
 }
 
@@ -92,7 +101,7 @@ impl Stream {
                 self.spool.process(&data);
                 self.offset += data.len() as u64;
                 for flow in self.attachments.values_mut() {
-                    flow.queue.extend_from_slice(&data);
+                    flow.queue(&data);
                 }
             }
             Command::Attach {
@@ -103,32 +112,29 @@ impl Stream {
                 done,
             } => {
                 reply.send(Ok(result));
-                let snapshot = self.spool.snapshot();
-                let sent = snapshot.len() as u64;
-                let _ = connection.frames.send(Frame::Snapshot {
-                    attachment,
-                    offset: self.offset,
-                    data: snapshot,
-                });
-                self.attachments.insert(
-                    attachment,
-                    Flow {
-                        connection,
-                        sent,
-                        acked: 0,
-                        paused: false,
-                        queue: Vec::new(),
-                    },
-                );
+                let mut flow = Flow {
+                    connection,
+                    sent: 0,
+                    acked: 0,
+                    paused: false,
+                    behind: false,
+                    queue: Vec::new(),
+                };
+                flow.catch_up(attachment, &mut self.spool, self.offset);
+                self.attachments.insert(attachment, flow);
                 let _ = done.send(());
             }
             Command::Ack { attachment, bytes } => {
                 if let Some(flow) = self.attachments.get_mut(&attachment) {
                     flow.acked = flow.acked.max(bytes.min(flow.sent));
+                    if flow.behind {
+                        flow.catch_up(attachment, &mut self.spool, self.offset);
+                    }
                 }
             }
-            Command::Detach(attachment) => {
+            Command::Detach { attachment, done } => {
                 self.attachments.remove(&attachment);
+                drop(done);
             }
             Command::Resize(size) => self.spool.resize(size),
             Command::Close => self.attachments.clear(),
@@ -143,16 +149,33 @@ impl Stream {
 }
 
 impl Flow {
+    fn queue(&mut self, data: &[u8]) {
+        if !self.behind {
+            self.queue.extend_from_slice(data);
+        }
+    }
+
+    /// Sends a SNAPSHOT at `offset`; output queues again from there.
+    fn catch_up(&mut self, attachment: AttachmentId, spool: &mut GhosttySpool, offset: u64) {
+        let snapshot = spool.snapshot();
+        self.sent += snapshot.len() as u64;
+        self.behind = false;
+        self.paused = false;
+        let _ = self.connection.frames.send(Frame::Snapshot {
+            attachment,
+            offset,
+            data: snapshot,
+        });
+    }
+
     /// Sends what the window allows; false once the connection is gone.
+    /// Past [`MAX_QUEUE`] of what it could not send, the flow is behind.
     fn flush(&mut self, attachment: AttachmentId, offset: u64) -> bool {
-        if self.paused {
-            if self.sent - self.acked > LOW_WATER {
-                return true;
-            }
+        if self.paused && self.sent - self.acked <= LOW_WATER {
             self.paused = false;
         }
         let mut start = 0;
-        while start < self.queue.len() {
+        while !self.paused && start < self.queue.len() {
             let unacked = self.sent - self.acked;
             if unacked >= WINDOW {
                 self.paused = true;
@@ -173,6 +196,10 @@ impl Flow {
             start += take;
         }
         self.queue.drain(..start);
+        if self.queue.len() > MAX_QUEUE {
+            self.behind = true;
+            self.queue = Vec::new();
+        }
         true
     }
 }

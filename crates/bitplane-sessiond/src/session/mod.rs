@@ -60,6 +60,8 @@ struct Attached {
     connection: u64,
     session: SessionId,
     size: Size,
+    read_only: bool,
+    ignore_size: bool,
 }
 
 impl Sessions {
@@ -106,7 +108,8 @@ impl Module for Sessions {
                 }
                 method::SESSION_ATTACHMENT_CLOSE => {
                     let AttachmentRef { attachment } = params(call.params)?;
-                    shared.detach(call.connection.id, attachment)?;
+                    let detached = shared.detach(call.connection.id, attachment)?;
+                    let _ = detached.await;
                     Ok(json!({}))
                 }
                 method::SESSION_ATTACHMENT_ACK => {
@@ -254,6 +257,8 @@ impl Shared {
             session,
             cols,
             rows,
+            read_only,
+            ignore_size,
         } = params(call.params)?;
         let (done, attached) = oneshot::channel();
         {
@@ -275,6 +280,8 @@ impl Shared {
                     connection: call.connection.id,
                     session: session.clone(),
                     size: Size { cols, rows },
+                    read_only,
+                    ignore_size,
                 },
             );
             entry.info.attachments += 1;
@@ -313,7 +320,12 @@ impl Shared {
         Ok(())
     }
 
-    fn detach(&self, connection: u64, attachment: AttachmentId) -> Result<(), RpcError> {
+    /// Resolves once no more frames are sent to the attachment.
+    fn detach(
+        &self,
+        connection: u64,
+        attachment: AttachmentId,
+    ) -> Result<oneshot::Receiver<()>, RpcError> {
         let mut state = self.state.lock().unwrap();
         if state
             .attachments
@@ -323,12 +335,13 @@ impl Shared {
             return Err(unknown_attachment(attachment));
         }
         let attached = state.attachments.remove(&attachment).expect("checked");
+        let (done, detached) = oneshot::channel();
         if let Some(entry) = state.sessions.get_mut(&attached.session) {
-            let _ = entry.stream.send(Command::Detach(attachment));
+            let _ = entry.stream.send(Command::Detach { attachment, done });
             entry.info.attachments -= 1;
             self.changed(&entry.info);
         }
-        Ok(())
+        Ok(detached)
     }
 
     fn ack(&self, connection: u64, params: AttachmentAckParams) {
@@ -353,28 +366,38 @@ impl Shared {
         data: Vec<u8>,
     ) -> Result<(), (ErrorCode, String)> {
         let mut state = self.state.lock().unwrap();
-        let session = state
+        let attached = state
             .attachments
             .get(&attachment)
             .filter(|attached| attached.connection == connection)
-            .map(|attached| attached.session.clone())
             .ok_or_else(|| {
                 (
                     ErrorCode::UnknownAttachment,
                     format!("no attachment {attachment} on this connection"),
                 )
             })?;
-        let Some(pty) = state.sessions.get(&session).and_then(|e| e.pty.as_ref()) else {
+        if attached.read_only {
+            return Err((ErrorCode::ReadOnly, "the attachment is read-only".into()));
+        }
+        let session = attached.session.clone();
+        if state.sessions.get(&session).is_none_or(|e| e.pty.is_none()) {
             return Err((ErrorCode::SessionExited, "the shell has exited".into()));
-        };
-        pty.write(data);
+        }
+        // Resized first, so the shell reads this input at the new size.
         self.activity(&mut state, attachment);
+        if let Some(pty) = state.sessions.get(&session).and_then(|e| e.pty.as_ref()) {
+            pty.write(data);
+        }
         Ok(())
     }
 
     /// The latest active attachment owns the size (ADR 0026).
     fn activity(&self, state: &mut State, attachment: AttachmentId) {
-        let Some(attached) = state.attachments.get(&attachment) else {
+        let Some(attached) = state
+            .attachments
+            .get(&attachment)
+            .filter(|attached| !attached.ignore_size)
+        else {
             return;
         };
         let size = attached.size;
