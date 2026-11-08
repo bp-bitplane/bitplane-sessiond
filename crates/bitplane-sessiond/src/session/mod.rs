@@ -26,7 +26,7 @@ use crate::module::{Availability, BoxFuture, Call, Connection, Events, Module, M
 use self::pty::{PARENT_SESSION_VARS, Pty, Spawn};
 use self::stream::Command;
 
-pub use self::spool::SCROLLBACK_BYTES;
+pub use self::spool::{GhosttySpool, SCROLLBACK_BYTES, Spool};
 
 const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
 
