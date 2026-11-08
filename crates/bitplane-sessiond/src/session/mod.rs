@@ -6,13 +6,15 @@ mod spool;
 mod stream;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::time::Duration;
 
 use bitplane_protocol::session::{
     AttachmentAckParams, AttachmentError, AttachmentId, AttachmentOpenParams, AttachmentOpenResult,
-    AttachmentRef, AttachmentResizeParams, Session, SessionId, SessionListResult,
-    SessionOpenParams, SessionRef, SessionResult, SessionStatus, Size,
+    AttachmentRef, AttachmentResizeParams, Session, SessionBusyResult, SessionId,
+    SessionListResult, SessionOpenParams, SessionRef, SessionRenameParams, SessionResult,
+    SessionStatus, Size,
 };
 use bitplane_protocol::{ErrorCode, Frame, Notification, RpcError, method};
 use serde::Serialize;
@@ -29,6 +31,9 @@ use self::stream::Command;
 pub use self::spool::{GhosttySpool, SCROLLBACK_BYTES, Spool};
 
 const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
+/// How often roots and foreground processes are checked. Polling also sees
+/// an ancestor renamed or unmounted, which a watch on the root misses.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 pub struct Sessions {
@@ -51,9 +56,13 @@ struct State {
 
 struct Entry {
     info: Session,
+    /// What every shell of the session starts with.
+    env: EnvMap,
     stream: mpsc::Sender<Command>,
     /// `None` once the shell exited or failed to start.
     pty: Option<Pty>,
+    /// Counts the session's shells; a stale one's exit is ignored.
+    generation: u64,
 }
 
 struct Attached {
@@ -84,11 +93,18 @@ impl Module for Sessions {
     }
 
     fn start(&self, context: ModuleContext) {
-        let _ = self.shared.set(Arc::new(Shared {
+        let shared = Arc::new(Shared {
             env: context.env,
             events: context.events,
             state: Mutex::new(State::default()),
-        }));
+        });
+        let weak = Arc::downgrade(&shared);
+        if self.shared.set(shared).is_ok() {
+            std::thread::Builder::new()
+                .name("session-watch".into())
+                .spawn(move || watch(&weak))
+                .expect("spawning a thread");
+        }
     }
 
     fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>> {
@@ -97,6 +113,9 @@ impl Module for Sessions {
             match call.method.as_str() {
                 method::SESSION_LIST => to_value(shared.list()),
                 method::SESSION_OPEN => to_value(shared.open(params(call.params)?)?),
+                method::SESSION_RESTART => to_value(shared.restart(params(call.params)?)?),
+                method::SESSION_BUSY => to_value(shared.busy(params(call.params)?)?),
+                method::SESSION_RENAME => to_value(shared.rename(params(call.params)?)?),
                 method::SESSION_CLOSE => {
                     shared.close(params(call.params)?)?;
                     Ok(json!({}))
@@ -188,46 +207,137 @@ impl Shared {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let env = session_env(&self.env, &params, &id);
-        let shell = env::resolve_shell(env.get("SHELL").map(String::as_str));
-        let stream = stream::spawn(DEFAULT_SIZE);
+        let weak = Arc::downgrade(self);
+        let titled_id = id.clone();
+        let stream = stream::spawn(DEFAULT_SIZE, move |title| {
+            retitled(&weak, &titled_id, title)
+        });
 
         let mut state = self.state.lock().unwrap();
         state.next_seq += 1;
+        let mut entry = Entry {
+            info: Session {
+                id: id.clone(),
+                seq: state.next_seq,
+                root: params.root,
+                plane: params.plane,
+                name: user_name(params.name),
+                title: None,
+                foreground: None,
+                status: SessionStatus::Running,
+                root_gone: false,
+                size: DEFAULT_SIZE,
+                attachments: 0,
+            },
+            env,
+            stream,
+            pty: None,
+            generation: 0,
+        };
+        self.spawn_shell(&mut entry);
+        let info = entry.info.clone();
+        state.sessions.insert(id, entry);
+        self.changed(&info);
+        Ok(SessionResult { session: info })
+    }
+
+    /// Hangs up the shell if it still runs and starts a new one in the root,
+    /// under the same id, at the session's size.
+    fn restart(
+        self: &Arc<Self>,
+        SessionRef { session }: SessionRef,
+    ) -> Result<SessionResult, RpcError> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| unknown_session(&session))?;
+        if !Path::new(&entry.info.root).is_dir() {
+            if !entry.info.root_gone {
+                entry.info.root_gone = true;
+                self.changed(&entry.info);
+            }
+            return Err(RpcError::protocol(
+                ErrorCode::RootGone,
+                format!(
+                    "{} no longer exists; close the session instead",
+                    entry.info.root
+                ),
+                None,
+            ));
+        }
+        if let Some(pty) = entry.pty.take() {
+            pty.hang_up();
+        }
+        entry.info.root_gone = false;
+        entry.info.title = None;
+        self.spawn_shell(entry);
+        self.changed(&entry.info);
+        Ok(SessionResult {
+            session: entry.info.clone(),
+        })
+    }
+
+    fn busy(&self, SessionRef { session }: SessionRef) -> Result<SessionBusyResult, RpcError> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state
+            .sessions
+            .get_mut(&session)
+            .ok_or_else(|| unknown_session(&session))?;
+        let foreground = entry.pty.as_ref().and_then(Pty::foreground);
+        let name = foreground.as_ref().and_then(|fg| fg.name.clone());
+        if entry.pty.is_some() && entry.info.foreground != name {
+            entry.info.foreground.clone_from(&name);
+            self.changed(&entry.info);
+        }
+        let busy = foreground.is_some_and(|fg| fg.busy);
+        Ok(SessionBusyResult {
+            busy,
+            process_name: name.filter(|_| busy),
+        })
+    }
+
+    fn rename(&self, params: SessionRenameParams) -> Result<SessionResult, RpcError> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state
+            .sessions
+            .get_mut(&params.session)
+            .ok_or_else(|| unknown_session(&params.session))?;
+        let name = user_name(params.name);
+        if entry.info.name != name {
+            entry.info.name = name;
+            self.changed(&entry.info);
+        }
+        Ok(SessionResult {
+            session: entry.info.clone(),
+        })
+    }
+
+    /// The stream starts afresh first, so it drops what the old shell still writes.
+    fn spawn_shell(self: &Arc<Self>, entry: &mut Entry) {
+        entry.generation += 1;
+        let generation = entry.generation;
+        let size = entry.info.size;
+        let _ = entry.stream.send(Command::Restart { generation, size });
+        let shell = env::resolve_shell(entry.env.get("SHELL").map(String::as_str));
         let weak = Arc::downgrade(self);
-        let exited_id = id.clone();
+        let id = entry.info.id.clone();
         let spawned = Pty::spawn(
             Spawn {
                 shell: &shell,
-                root: &root,
-                env,
-                size: DEFAULT_SIZE,
-                output: stream.clone(),
+                root: Path::new(&entry.info.root),
+                env: entry.env.clone(),
+                size,
+                generation,
+                output: entry.stream.clone(),
             },
-            move |code| exited(&weak, &exited_id, code),
+            move |code| exited(&weak, &id, generation, code),
         );
-        let (pty, status) = match spawned {
+        entry.info.foreground = None;
+        (entry.pty, entry.info.status) = match spawned {
             Ok(pty) => (Some(pty), SessionStatus::Running),
             Err(error) => (None, SessionStatus::SpawnFailed { error }),
         };
-        let info = Session {
-            id: id.clone(),
-            seq: state.next_seq,
-            root: params.root,
-            plane: params.plane,
-            status,
-            size: DEFAULT_SIZE,
-            attachments: 0,
-        };
-        state.sessions.insert(
-            id,
-            Entry {
-                info: info.clone(),
-                stream,
-                pty,
-            },
-        );
-        self.changed(&info);
-        Ok(SessionResult { session: info })
     }
 
     fn close(&self, SessionRef { session }: SessionRef) -> Result<(), RpcError> {
@@ -426,7 +536,25 @@ impl Shared {
     }
 }
 
-fn exited(shared: &Weak<Shared>, id: &str, code: i32) {
+fn exited(shared: &Weak<Shared>, id: &str, generation: u64, code: i32) {
+    let Some(shared) = shared.upgrade() else {
+        return;
+    };
+    let mut state = shared.state.lock().unwrap();
+    let Some(entry) = state
+        .sessions
+        .get_mut(id)
+        .filter(|entry| entry.generation == generation)
+    else {
+        return;
+    };
+    entry.pty = None;
+    entry.info.foreground = None;
+    entry.info.status = SessionStatus::Exited { code };
+    shared.changed(&entry.info);
+}
+
+fn retitled(shared: &Weak<Shared>, id: &str, title: Option<String>) {
     let Some(shared) = shared.upgrade() else {
         return;
     };
@@ -434,9 +562,54 @@ fn exited(shared: &Weak<Shared>, id: &str, code: i32) {
     let Some(entry) = state.sessions.get_mut(id) else {
         return;
     };
-    entry.pty = None;
-    entry.info.status = SessionStatus::Exited { code };
-    shared.changed(&entry.info);
+    if entry.info.title != title {
+        entry.info.title = title;
+        shared.changed(&entry.info);
+    }
+}
+
+/// Polls every session's root and foreground process until the module is gone.
+fn watch(shared: &Weak<Shared>) {
+    loop {
+        std::thread::sleep(WATCH_INTERVAL);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let roots: Vec<(SessionId, String)> = {
+            let state = shared.state.lock().unwrap();
+            state
+                .sessions
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.info.root.clone()))
+                .collect()
+        };
+        // Stat outside the lock: a hung mount must not stall the module.
+        let gone: Vec<(SessionId, bool)> = roots
+            .into_iter()
+            .map(|(id, root)| (id, !Path::new(&root).is_dir()))
+            .collect();
+        let mut state = shared.state.lock().unwrap();
+        for (id, gone) in gone {
+            let Some(entry) = state.sessions.get_mut(&id) else {
+                continue;
+            };
+            let foreground = entry
+                .pty
+                .as_ref()
+                .and_then(Pty::foreground)
+                .and_then(|fg| fg.name);
+            if entry.info.root_gone != gone || entry.info.foreground != foreground {
+                entry.info.root_gone = gone;
+                entry.info.foreground = foreground;
+                shared.changed(&entry.info);
+            }
+        }
+    }
+}
+
+/// A name of only whitespace is no name, as in cc.
+fn user_name(name: Option<String>) -> Option<String> {
+    name.filter(|name| !name.trim().is_empty())
 }
 
 /// The login-shell env, minus what a parent session or daemon leaked into

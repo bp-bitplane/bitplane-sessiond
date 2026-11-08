@@ -25,7 +25,17 @@ pub const MAX_QUEUE: usize = 256 * 1024;
 pub const MAX_FRAME: usize = 16 * 1024;
 
 pub enum Command {
-    Output(Vec<u8>),
+    /// Output of the PTY of `generation`; an older one's is dropped.
+    Output {
+        generation: u64,
+        data: Vec<u8>,
+    },
+    /// A new shell: the terminal starts fresh and every attachment gets a
+    /// SNAPSHOT of it at the current offset.
+    Restart {
+        generation: u64,
+        size: Size,
+    },
     /// Sends `result` as the reply, then the SNAPSHOT, then subscribes.
     Attach {
         attachment: AttachmentId,
@@ -50,17 +60,23 @@ pub enum Command {
 }
 
 /// Starts the stream's thread; it ends once every sender is dropped.
-pub fn spawn(size: Size) -> mpsc::Sender<Command> {
+/// `titled` gets the program's title whenever it changes.
+pub fn spawn(
+    size: Size,
+    titled: impl Fn(Option<String>) + Send + 'static,
+) -> mpsc::Sender<Command> {
     let (commands, received) = mpsc::channel();
     std::thread::Builder::new()
         .name("session-stream".into())
-        .spawn(move || run(size, received))
+        .spawn(move || run(size, received, titled))
         .expect("spawning a thread");
     commands
 }
 
 struct Stream {
     spool: GhosttySpool,
+    generation: u64,
+    title: Option<String>,
     /// Session output bytes so far; the offset of the next one.
     offset: u64,
     attachments: HashMap<AttachmentId, Flow>,
@@ -78,9 +94,11 @@ struct Flow {
     queue: Vec<u8>,
 }
 
-fn run(size: Size, commands: mpsc::Receiver<Command>) {
+fn run(size: Size, commands: mpsc::Receiver<Command>, titled: impl Fn(Option<String>)) {
     let mut stream = Stream {
         spool: GhosttySpool::new(size),
+        generation: 0,
+        title: None,
         offset: 0,
         attachments: HashMap::new(),
     };
@@ -91,17 +109,34 @@ fn run(size: Size, commands: mpsc::Receiver<Command>) {
             stream.handle(command);
         }
         stream.flush();
+        let title = stream.spool.title();
+        if title != stream.title {
+            stream.title.clone_from(&title);
+            titled(title);
+        }
     }
 }
 
 impl Stream {
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Output(data) => {
+            Command::Output { generation, data } => {
+                if generation != self.generation {
+                    return;
+                }
                 self.spool.process(&data);
                 self.offset += data.len() as u64;
                 for flow in self.attachments.values_mut() {
                     flow.queue(&data);
+                }
+            }
+            Command::Restart { generation, size } => {
+                self.generation = generation;
+                self.spool = GhosttySpool::new(size);
+                self.title = None;
+                for (&attachment, flow) in &mut self.attachments {
+                    flow.queue.clear();
+                    flow.catch_up(attachment, &mut self.spool, self.offset);
                 }
             }
             Command::Attach {

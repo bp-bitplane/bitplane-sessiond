@@ -34,6 +34,14 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     input: mpsc::Sender<Vec<u8>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    shell_pid: Option<u32>,
+}
+
+/// The terminal's foreground process group, as cc's busy check sees it.
+pub struct Foreground {
+    pub name: Option<String>,
+    /// The group is not the shell's.
+    pub busy: bool,
 }
 
 /// What a shell is started with, besides its environment.
@@ -42,6 +50,8 @@ pub struct Spawn<'a> {
     pub root: &'a Path,
     pub env: EnvMap,
     pub size: Size,
+    /// Tags this PTY's output, so a restarted session's stream drops the old one's.
+    pub generation: u64,
     /// Gets the shell's output, then nothing once the PTY closes.
     pub output: mpsc::Sender<Command>,
 }
@@ -71,9 +81,11 @@ impl Pty {
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let killer = child.clone_killer();
+        let shell_pid = child.process_id();
 
         let (input, inputs) = mpsc::channel();
-        spawn_thread("pty-read", move || read(reader, spawn.output));
+        let generation = spawn.generation;
+        spawn_thread("pty-read", move || read(reader, generation, spawn.output));
         spawn_thread("pty-write", move || write(writer, inputs));
         spawn_thread("pty-wait", move || {
             let code = child
@@ -86,6 +98,17 @@ impl Pty {
             master: pair.master,
             input,
             killer,
+            shell_pid,
+        })
+    }
+
+    pub fn foreground(&self) -> Option<Foreground> {
+        let leader = self.master.process_group_leader()?;
+        Some(Foreground {
+            name: process_name(leader),
+            busy: self
+                .shell_pid
+                .is_some_and(|shell| shell as libc::pid_t != leader),
         })
     }
 
@@ -117,13 +140,14 @@ impl Pty {
     }
 }
 
-fn read(mut reader: Box<dyn Read + Send>, output: mpsc::Sender<Command>) {
+fn read(mut reader: Box<dyn Read + Send>, generation: u64, output: mpsc::Sender<Command>) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => return,
             Ok(n) => {
-                if output.send(Command::Output(buf[..n].to_vec())).is_err() {
+                let data = buf[..n].to_vec();
+                if output.send(Command::Output { generation, data }).is_err() {
                     return;
                 }
             }
@@ -141,6 +165,20 @@ fn write(mut writer: Box<dyn Write + Send>, inputs: mpsc::Receiver<Vec<u8>>) {
             return;
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_name(pid: libc::pid_t) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: proc_name writes at most `buf.len()` bytes into `buf`.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (len > 0).then(|| String::from_utf8_lossy(&buf[..len as usize]).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_name(pid: libc::pid_t) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().to_string()).filter(|name| !name.is_empty())
 }
 
 fn pty_size(size: Size) -> PtySize {

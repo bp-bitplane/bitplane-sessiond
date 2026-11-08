@@ -16,6 +16,8 @@ pub const SCROLLBACK_BYTES: usize = 10 * 1024 * 1024;
 pub trait Spool {
     fn process(&mut self, data: &[u8]);
     fn resize(&mut self, size: Size);
+    /// The title the program set (OSC 0/2), without control characters.
+    fn title(&self) -> Option<String>;
     /// VT bytes that redraw the terminal as it is now on a fresh one.
     fn snapshot(&mut self) -> Vec<u8>;
 }
@@ -51,6 +53,11 @@ impl Spool for GhosttySpool {
             .resize(size.cols.max(1), size.rows.max(1), 0, 0);
     }
 
+    fn title(&self) -> Option<String> {
+        let title = self.terminal.title().ok()?;
+        Some(title.chars().filter(|c| !c.is_control()).collect()).filter(|t: &String| !t.is_empty())
+    }
+
     fn snapshot(&mut self) -> Vec<u8> {
         let options = FormatterOptions::new()
             .with_format(Format::Vt)
@@ -78,10 +85,7 @@ impl Spool for GhosttySpool {
         let padding = self.blank_row_padding();
         let at = rfind(&snapshot, &cup).unwrap_or(snapshot.len());
         snapshot.splice(at..at, padding);
-        if let Ok(title) = self.terminal.title()
-            && !title.is_empty()
-        {
-            let title: String = title.chars().filter(|c| !c.is_control()).collect();
+        if let Some(title) = self.title() {
             snapshot.extend_from_slice(format!("\x1b]2;{title}\x1b\\").as_bytes());
         }
         if let Some(decscusr) = self.decscusr() {
