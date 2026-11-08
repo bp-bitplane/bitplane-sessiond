@@ -1,0 +1,478 @@
+mod support;
+
+use std::path::PathBuf;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
+
+use bitplane_sessiond::client::Client;
+use bitplane_sessiond::paths::Dirs;
+use bitplane_sessiond::pidfile::Pidfile;
+use serde_json::{Value, json};
+use support::{Screen, open, short_tempdir};
+
+const EXE: &str = env!("CARGO_BIN_EXE_bitplane-sessiond");
+
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    ShutdownWithRestore,
+    Sigterm,
+    Sigkill,
+}
+
+#[tokio::test]
+async fn shutdown_with_restore_brings_every_session_back() {
+    sessions_come_back_after(Stop::ShutdownWithRestore).await;
+}
+
+#[tokio::test]
+async fn a_sigterm_brings_every_session_back() {
+    sessions_come_back_after(Stop::Sigterm).await;
+}
+
+#[tokio::test]
+async fn a_sigkill_brings_every_session_back() {
+    sessions_come_back_after(Stop::Sigkill).await;
+}
+
+async fn sessions_come_back_after(stop: Stop) {
+    let host = Host::new();
+    let mut first = host.serve();
+    let mut client = first.connect().await;
+    let before = client.hello("test").await.unwrap().daemon.instance;
+    let roots: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let mut opened = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        let session = open(
+            &client,
+            json!({
+                "root": root.path(),
+                "name": format!("tab-{i}"),
+                "plane": format!("plane-{i}"),
+                "env": { "RESTORE_MARK": format!("mark-{i}") },
+            }),
+        )
+        .await;
+        opened.push(session["id"].as_str().unwrap().to_owned());
+    }
+    client
+        .call(
+            "session.rename",
+            Some(json!({ "session": opened[1], "name": "renamed" })),
+        )
+        .await
+        .unwrap();
+    client
+        .call("session.close", Some(json!({ "session": opened[3] })))
+        .await
+        .unwrap();
+    let mut screen = Screen::attach_with(
+        &mut client,
+        json!({ "session": opened[2], "cols": 120, "rows": 40 }),
+    )
+    .await;
+    screen.type_text(&client, "echo sized-$((6*7))\r");
+    screen.wait_for(&mut client, "sized-42").await;
+    let listed = client.call("session.list", None).await.unwrap()["sessions"].clone();
+    assert_eq!(listed[2]["size"], json!({ "cols": 120, "rows": 40 }));
+
+    first.stop(&client, stop).await;
+    drop(client);
+
+    let mut second = host.serve();
+    let mut client = second.connect().await;
+    let after = client.hello("test").await.unwrap().daemon.instance;
+    assert_ne!(before, after, "a new instance");
+    let restored = client.call("session.list", None).await.unwrap()["sessions"].clone();
+    let summary = |sessions: &Value| -> Vec<Value> {
+        sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                json!([
+                    s["id"], s["seq"], s["name"], s["plane"], s["root"], s["size"]
+                ])
+            })
+            .collect()
+    };
+    assert_eq!(summary(&restored), summary(&listed), "after {stop:?}");
+    assert_eq!(restored[1]["name"], "renamed");
+    for session in restored.as_array().unwrap() {
+        assert_eq!(session["status"], json!({ "state": "running" }));
+        assert!(session.get("title").is_none());
+    }
+    let mut screen = Screen::attach(&mut client, &opened[2]).await;
+    screen.type_text(&client, "echo \"got-$RESTORE_MARK-$BITPLANE_SESSION_ID\"\r");
+    screen
+        .wait_for(&mut client, &format!("got-mark-2-{}", opened[2]))
+        .await;
+}
+
+#[tokio::test]
+async fn shutdown_without_restore_hangs_up_every_session_and_forgets_them() {
+    let host = Host::new();
+    let mut first = host.serve();
+    let mut client = first.connect().await;
+    client.hello("test").await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let session = open(&client, json!({ "root": root.path() })).await;
+    let mut screen = Screen::attach(&mut client, session["id"].as_str().unwrap()).await;
+    screen.type_text(&client, "echo $$ > pid; echo pid-$((6*7))\r");
+    screen.wait_for(&mut client, "pid-42").await;
+    let pid: i32 = std::fs::read_to_string(root.path().join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    first.shutdown(&client, false).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid = rustix::process::Pid::from_raw(pid).unwrap();
+    while rustix::process::test_kill_process(pid).is_ok() {
+        assert!(Instant::now() < deadline, "the shell outlived the shutdown");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut second = host.serve();
+    let client = second.connect().await;
+    client.hello("test").await.unwrap();
+    let listed = client.call("session.list", None).await.unwrap();
+    assert_eq!(listed["sessions"], json!([]));
+}
+
+#[tokio::test]
+async fn exited_and_spawn_failed_sessions_come_back_running() {
+    let host = Host::new();
+    let mut first = host.serve();
+    let mut client = first.connect().await;
+    client.hello("test").await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let exited = open(&client, json!({ "root": root.path() })).await;
+    let screen = Screen::attach(&mut client, exited["id"].as_str().unwrap()).await;
+    screen.type_text(&client, "exit 3\r");
+    wait_for_status(&client, 0, json!({ "state": "exited", "code": 3 })).await;
+    let shell = root.path().join("shell");
+    let failed = open(
+        &client,
+        json!({ "root": root.path(), "env": { "SHELL": shell } }),
+    )
+    .await;
+    assert_eq!(failed["status"]["state"], "spawnFailed");
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+
+    first.stop(&client, Stop::Sigterm).await;
+
+    let mut second = host.serve();
+    let client = second.connect().await;
+    client.hello("test").await.unwrap();
+    let listed = client.call("session.list", None).await.unwrap()["sessions"].clone();
+    assert_eq!(listed[0]["id"], exited["id"]);
+    assert_eq!(listed[1]["id"], failed["id"]);
+    for session in listed.as_array().unwrap() {
+        assert_eq!(session["status"], json!({ "state": "running" }));
+    }
+}
+
+#[tokio::test]
+async fn a_session_whose_root_is_gone_comes_back_exited_until_the_root_returns() {
+    let host = Host::new();
+    let mut first = host.serve();
+    let client = first.connect().await;
+    client.hello("test").await.unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("plane");
+    std::fs::create_dir(&root).unwrap();
+    let session = open(&client, json!({ "root": root })).await;
+    let id = session["id"].as_str().unwrap();
+    first.stop(&client, Stop::Sigterm).await;
+    std::fs::remove_dir(&root).unwrap();
+
+    let mut second = host.serve();
+    let client = second.connect().await;
+    client.hello("test").await.unwrap();
+    let listed = client.call("session.list", None).await.unwrap()["sessions"].clone();
+    assert_eq!(listed[0]["id"], id);
+    assert_eq!(listed[0]["status"]["state"], "exited");
+    assert_eq!(listed[0]["rootGone"], true);
+    assert!(
+        client
+            .call("session.restart", Some(json!({ "session": id })))
+            .await
+            .is_err()
+    );
+
+    std::fs::create_dir(&root).unwrap();
+    let restarted = client
+        .call("session.restart", Some(json!({ "session": id })))
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted["session"]["status"],
+        json!({ "state": "running" })
+    );
+    assert_eq!(restarted["session"]["rootGone"], false);
+}
+
+#[tokio::test]
+async fn another_versions_sessions_are_adopted_when_its_daemon_is_not_running() {
+    let host = Host::new();
+    let mut first = host.serve();
+    let client = first.connect().await;
+    client.hello("test").await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let ours: Vec<Value> = [
+        open(&client, json!({ "root": root.path(), "name": "ours-1" })).await,
+        open(&client, json!({ "root": root.path(), "name": "ours-2" })).await,
+    ]
+    .into();
+    first.stop(&client, Stop::Sigterm).await;
+    let older = host.other_version("0");
+    let older_file = write_sessions(
+        &older,
+        json!({ "version": 1, "sessions": [
+            { "id": "old-b", "seq": 9, "root": root.path(), "name": "old-b",
+              "size": { "cols": 100, "rows": 30 },
+              "agent": { "agentSession": "a-1", "cwd": root.path() } },
+            { "id": "old-a", "seq": 4, "root": root.path(), "name": "old-a",
+              "size": { "cols": 80, "rows": 24 } },
+        ]}),
+    );
+    let running = host.other_version("7");
+    let running_file = write_sessions(
+        &running,
+        json!({ "version": 1, "sessions": [
+            { "id": "live", "seq": 1, "root": root.path(), "size": { "cols": 80, "rows": 24 } },
+        ]}),
+    );
+    std::fs::create_dir_all(&running.runtime).unwrap();
+    let _running = Pidfile::acquire(&running.pidfile()).unwrap();
+
+    let mut second = host.serve();
+    let client = second.connect().await;
+    client.hello("test").await.unwrap();
+
+    let listed = client.call("session.list", None).await.unwrap()["sessions"].clone();
+    let order: Vec<Value> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| json!([s["id"], s["seq"]]))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            json!([ours[0]["id"], 1]),
+            json!([ours[1]["id"], 2]),
+            json!(["old-a", 3]),
+            json!(["old-b", 4]),
+        ]
+    );
+    assert_eq!(listed[3]["size"], json!({ "cols": 100, "rows": 30 }));
+    assert!(!older_file.exists(), "the adopted file is deleted");
+    assert!(
+        running_file.exists(),
+        "a running version keeps its sessions"
+    );
+
+    second.stop(&client, Stop::Sigterm).await;
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(host.sessions_file()).unwrap()).unwrap();
+    assert_eq!(
+        saved["sessions"][3]["agent"],
+        json!({ "agentSession": "a-1", "cwd": root.path() }),
+        "the agent link is kept for the agent adapter"
+    );
+}
+
+#[tokio::test]
+async fn a_newer_schema_is_left_alone_and_an_older_one_is_read() {
+    let host = Host::new();
+    let root = tempfile::tempdir().unwrap();
+    let newer = json!({ "version": 999, "sessions": [], "tabs": [{ "id": "x" }] });
+    let file = write_sessions(&host.dirs, newer.clone());
+
+    let mut first = host.serve();
+    let client = first.connect().await;
+    client.hello("test").await.unwrap();
+    assert_eq!(
+        client.call("session.list", None).await.unwrap()["sessions"],
+        json!([])
+    );
+    open(&client, json!({ "root": root.path() })).await;
+    first.stop(&client, Stop::Sigterm).await;
+    let kept: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(kept, newer, "an older daemon never rewrites a newer file");
+
+    // Version 1 as the first daemon to persist wrote it: only required fields.
+    write_sessions(
+        &host.dirs,
+        json!({ "version": 1, "sessions": [
+            { "id": "v1", "seq": 1, "root": root.path(), "size": { "cols": 80, "rows": 24 } },
+        ]}),
+    );
+    let mut second = host.serve();
+    let client = second.connect().await;
+    client.hello("test").await.unwrap();
+    let listed = client.call("session.list", None).await.unwrap()["sessions"].clone();
+    assert_eq!(listed[0]["id"], "v1");
+    assert_eq!(listed[0]["status"], json!({ "state": "running" }));
+}
+
+async fn wait_for_status(client: &Client, index: usize, status: Value) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let listed = client.call("session.list", None).await.unwrap();
+        if listed["sessions"][index]["status"] == status {
+            return;
+        }
+        assert!(Instant::now() < deadline, "no {status} in {listed}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn write_sessions(dirs: &Dirs, file: Value) -> PathBuf {
+    let dir = dirs.state.join("session");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sessions.json");
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    path
+}
+
+/// A host's directories in a temp dir, keyed by protocol version like the
+/// real ones, so other versions' dirs sit next to them.
+struct Host {
+    dirs: Dirs,
+    base: PathBuf,
+    home: tempfile::TempDir,
+    _root: tempfile::TempDir,
+}
+
+impl Host {
+    fn new() -> Self {
+        let (root, base) = short_tempdir();
+        Self {
+            dirs: Dirs::for_version(&base.join("run"), &base.join("state")),
+            base,
+            home: tempfile::tempdir().unwrap(),
+            _root: root,
+        }
+    }
+
+    fn serve(&self) -> Daemon {
+        let log = self.base.join("daemon.log");
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let child = std::process::Command::new(EXE)
+            .arg("serve")
+            .arg("--runtime-dir")
+            .arg(&self.dirs.runtime)
+            .arg("--state-dir")
+            .arg(&self.dirs.state)
+            .env_clear()
+            .env("SHELL", "/bin/sh")
+            .env("HOME", self.home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("PS1", "$ ")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        Daemon {
+            child,
+            socket: self.dirs.socket(),
+            log,
+        }
+    }
+
+    fn sessions_file(&self) -> PathBuf {
+        self.dirs.state.join("session").join("sessions.json")
+    }
+
+    /// Where another protocol version's daemon keeps its socket and state.
+    fn other_version(&self, version: &str) -> Dirs {
+        let versions = |base: &str| self.base.join(base).join("bitplane").join("sessiond");
+        Dirs {
+            runtime: versions("run").join(version),
+            state: versions("state").join(version),
+        }
+    }
+}
+
+/// The daemon this test spawned; only this child is ever signalled.
+struct Daemon {
+    child: Child,
+    socket: PathBuf,
+    log: PathBuf,
+}
+
+impl Daemon {
+    /// Retries until the daemon accepts, past a socket a killed one left.
+    async fn connect(&mut self) -> Client {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(client) = Client::connect(&self.socket).await {
+                return client;
+            }
+            let exited = self.child.try_wait().unwrap();
+            if exited.is_some() || Instant::now() >= deadline {
+                let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+                panic!("no daemon on {:?} ({exited:?}):\n{log}", self.socket);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn stop(&mut self, client: &Client, stop: Stop) {
+        match stop {
+            Stop::ShutdownWithRestore => {
+                let reply = client
+                    .call("daemon.shutdown", Some(json!({ "restore": true })))
+                    .await
+                    .unwrap();
+                assert_eq!(reply, json!({}));
+            }
+            Stop::Sigterm => self.signal(rustix::process::Signal::TERM),
+            Stop::Sigkill => {
+                // Past the 500 ms debounce: a crash loses at most that.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                self.signal(rustix::process::Signal::KILL);
+            }
+        }
+        self.wait().await;
+    }
+
+    async fn shutdown(&mut self, client: &Client, restore: bool) {
+        let reply = client
+            .call("daemon.shutdown", Some(json!({ "restore": restore })))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({}));
+        self.wait().await;
+    }
+
+    fn signal(&self, signal: rustix::process::Signal) {
+        let pid = rustix::process::Pid::from_child(&self.child);
+        rustix::process::kill_process(pid, signal).unwrap();
+    }
+
+    async fn wait(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the daemon did not exit");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}

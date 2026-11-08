@@ -47,6 +47,35 @@ impl Dirs {
         self.runtime.join("sessiond.pid")
     }
 
+    /// Every other protocol version's dirs that have state, oldest first:
+    /// the numbered siblings of `state`.
+    pub fn other_versions(&self) -> Vec<Self> {
+        let (Some(state_base), Some(runtime_base), Some(own)) = (
+            self.state.parent(),
+            self.runtime.parent(),
+            self.state.file_name(),
+        ) else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(state_base) else {
+            return Vec::new();
+        };
+        let mut versions: Vec<(u32, std::ffi::OsString)> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != own)
+            .filter_map(|name| Some((name.to_str()?.parse().ok()?, name)))
+            .collect();
+        versions.sort();
+        versions
+            .into_iter()
+            .map(|(_, name)| Self {
+                runtime: runtime_base.join(&name),
+                state: state_base.join(name),
+            })
+            .collect()
+    }
+
     /// Where an auto-started daemon's stdout and stderr go. Under `state`,
     /// so it outlives a reboot that clears the runtime dir.
     pub fn log(&self) -> PathBuf {

@@ -1,6 +1,8 @@
 //! The `session` module: shells on PTYs the daemon owns, and attachments
-//! that show and type into them (ADRs 0025, 0026).
+//! that show and type into them (ADRs 0025, 0026), persisted and restored
+//! as fresh shells across daemon restarts (ADR 0027).
 
+mod persist;
 mod pty;
 mod spool;
 mod stream;
@@ -25,11 +27,13 @@ use tokio::sync::oneshot;
 use crate::env::{self, EnvMap};
 use crate::module::{Availability, BoxFuture, Call, Connection, Events, Module, ModuleContext};
 
+use self::persist::{AgentLink, Persist, Record};
 use self::pty::{PARENT_SESSION_VARS, Pty, Spawn};
 use self::stream::Command;
 
 pub use self::spool::{GhosttySpool, SCROLLBACK_BYTES, Spool};
 
+const NAMESPACE: &str = "session";
 const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
 /// How often roots and foreground processes are checked. Polling also sees
 /// an ancestor renamed or unmounted, which a watch on the root misses.
@@ -44,6 +48,7 @@ struct Shared {
     env: Arc<EnvMap>,
     events: Events,
     state: Mutex<State>,
+    persist: Persist,
 }
 
 #[derive(Default)]
@@ -58,6 +63,9 @@ struct Entry {
     info: Session,
     /// What every shell of the session starts with.
     env: EnvMap,
+    /// The env `session.open` was given, which a restore starts from.
+    client_env: Option<EnvMap>,
+    agent: Option<AgentLink>,
     stream: mpsc::Sender<Command>,
     /// `None` once the shell exited or failed to start.
     pty: Option<Pty>,
@@ -85,25 +93,41 @@ impl Sessions {
 
 impl Module for Sessions {
     fn namespace(&self) -> &'static str {
-        "session"
+        NAMESPACE
     }
 
     fn probe(&self, _env: &EnvMap) -> Availability {
         Availability::Available { info: None }
     }
 
+    /// Restores every persisted session before returning, so the first
+    /// `session.list` is complete.
     fn start(&self, context: ModuleContext) {
+        let restored = persist::restore(&context.dirs, &context.state_dir);
         let shared = Arc::new(Shared {
             env: context.env,
             events: context.events,
             state: Mutex::new(State::default()),
+            persist: Persist::new(restored.file),
         });
+        shared.restore(restored.records);
         let weak = Arc::downgrade(&shared);
         if self.shared.set(shared).is_ok() {
+            let saver = weak.clone();
             std::thread::Builder::new()
                 .name("session-watch".into())
                 .spawn(move || watch(&weak))
                 .expect("spawning a thread");
+            std::thread::Builder::new()
+                .name("session-persist".into())
+                .spawn(move || save(&saver))
+                .expect("spawning a thread");
+        }
+    }
+
+    fn shutdown(&self, restore: bool) {
+        if let Some(shared) = self.shared.get() {
+            shared.shutdown(restore);
         }
     }
 
@@ -205,40 +229,96 @@ impl Shared {
                 None,
             ));
         }
-        let id = uuid::Uuid::new_v4().to_string();
-        let env = session_env(&self.env, &params, &id);
-        let weak = Arc::downgrade(self);
-        let titled_id = id.clone();
-        let stream = stream::spawn(DEFAULT_SIZE, move |title| {
-            retitled(&weak, &titled_id, title)
-        });
-
         let mut state = self.state.lock().unwrap();
         state.next_seq += 1;
-        let mut entry = Entry {
+        let mut entry = self.entry(Record {
+            id: uuid::Uuid::new_v4().to_string(),
+            seq: state.next_seq,
+            root: params.root,
+            plane: params.plane,
+            name: user_name(params.name),
+            env: params.env,
+            size: DEFAULT_SIZE,
+            agent: None,
+        });
+        self.spawn_shell(&mut entry);
+        let info = entry.info.clone();
+        state.sessions.insert(info.id.clone(), entry);
+        self.persist.touch();
+        self.changed(&info);
+        Ok(SessionResult { session: info })
+    }
+
+    /// Fresh shells for persisted sessions, except where the root is gone.
+    fn restore(self: &Arc<Self>, records: Vec<Record>) {
+        let mut state = self.state.lock().unwrap();
+        for record in records {
+            state.next_seq = state.next_seq.max(record.seq);
+            let mut entry = self.entry(record);
+            if Path::new(&entry.info.root).is_dir() {
+                self.spawn_shell(&mut entry);
+            } else {
+                entry.info.root_gone = true;
+                entry.info.status = SessionStatus::Exited { code: -1 };
+            }
+            state.sessions.insert(entry.info.id.clone(), entry);
+        }
+    }
+
+    /// A session without a shell yet.
+    fn entry(self: &Arc<Self>, record: Record) -> Entry {
+        let Record {
+            id,
+            seq,
+            root,
+            plane,
+            name,
+            env: client_env,
+            size,
+            agent,
+        } = record;
+        let env = session_env(&self.env, client_env.as_ref(), &id, plane.as_deref(), &root);
+        let weak = Arc::downgrade(self);
+        let titled_id = id.clone();
+        let stream = stream::spawn(size, move |title| retitled(&weak, &titled_id, title));
+        Entry {
             info: Session {
-                id: id.clone(),
-                seq: state.next_seq,
-                root: params.root,
-                plane: params.plane,
-                name: user_name(params.name),
+                id,
+                seq,
+                root,
+                plane,
+                name,
                 title: None,
                 foreground: None,
                 status: SessionStatus::Running,
                 root_gone: false,
-                size: DEFAULT_SIZE,
+                size,
                 attachments: 0,
             },
             env,
+            client_env,
+            agent,
             stream,
             pty: None,
             generation: 0,
-        };
-        self.spawn_shell(&mut entry);
-        let info = entry.info.clone();
-        state.sessions.insert(id, entry);
-        self.changed(&info);
-        Ok(SessionResult { session: info })
+        }
+    }
+
+    /// `restore` saves every session for the next instance before the shells
+    /// are hung up; otherwise they are hung up and forgotten.
+    fn shutdown(&self, restore: bool) {
+        let mut state = self.state.lock().unwrap();
+        if restore {
+            self.persist.close(Some(&records(&state)));
+        }
+        for entry in state.sessions.values_mut() {
+            if let Some(pty) = entry.pty.take() {
+                pty.hang_up();
+            }
+        }
+        if !restore {
+            self.persist.close(None);
+        }
     }
 
     /// Hangs up the shell if it still runs and starts a new one in the root,
@@ -306,6 +386,7 @@ impl Shared {
         let name = user_name(params.name);
         if entry.info.name != name {
             entry.info.name = name;
+            self.persist.touch();
             self.changed(&entry.info);
         }
         Ok(SessionResult {
@@ -353,6 +434,7 @@ impl Shared {
         if let Some(pty) = entry.pty {
             pty.hang_up();
         }
+        self.persist.touch();
         self.events.emit(
             method::SESSION_REMOVED,
             serde_json::to_value(SessionRef { session }).expect("protocol types serialize"),
@@ -522,6 +604,7 @@ impl Shared {
             pty.resize(size);
         }
         let _ = entry.stream.send(Command::Resize(size));
+        self.persist.touch();
         self.changed(&entry.info);
     }
 
@@ -566,6 +649,36 @@ fn retitled(shared: &Weak<Shared>, id: &str, title: Option<String>) {
         entry.info.title = title;
         shared.changed(&entry.info);
     }
+}
+
+/// Saves the sessions [`persist::DEBOUNCE`] after a change, until shutdown.
+fn save(shared: &Weak<Shared>) {
+    while let Some(shared) = shared.upgrade() {
+        if !shared.persist.due() {
+            return;
+        }
+        let records = records(&shared.state.lock().unwrap());
+        shared.persist.save(&records);
+    }
+}
+
+fn records(state: &State) -> Vec<Record> {
+    let mut records: Vec<Record> = state
+        .sessions
+        .values()
+        .map(|entry| Record {
+            id: entry.info.id.clone(),
+            seq: entry.info.seq,
+            root: entry.info.root.clone(),
+            plane: entry.info.plane.clone(),
+            name: entry.info.name.clone(),
+            env: entry.client_env.clone(),
+            size: entry.info.size,
+            agent: entry.agent.clone(),
+        })
+        .collect();
+    records.sort_by_key(|record| record.seq);
+    records
 }
 
 /// Polls every session's root and foreground process until the module is gone.
@@ -614,7 +727,13 @@ fn user_name(name: Option<String>) -> Option<String> {
 
 /// The login-shell env, minus what a parent session or daemon leaked into
 /// it, then the client's `env`, then the session's own variables.
-fn session_env(login: &EnvMap, params: &SessionOpenParams, id: &str) -> EnvMap {
+fn session_env(
+    login: &EnvMap,
+    client: Option<&EnvMap>,
+    id: &str,
+    plane: Option<&str>,
+    root: &str,
+) -> EnvMap {
     let mut env: EnvMap = login
         .iter()
         .filter(|(key, _)| {
@@ -622,11 +741,11 @@ fn session_env(login: &EnvMap, params: &SessionOpenParams, id: &str) -> EnvMap {
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    env.extend(params.env.clone().unwrap_or_default());
+    env.extend(client.cloned().unwrap_or_default());
     env.insert("BITPLANE_SESSION_ID".into(), id.into());
-    if let Some(plane) = &params.plane {
-        env.insert("BITPLANE_PLANE_ID".into(), plane.clone());
-        env.insert("BITPLANE_PLANE_DIR".into(), params.root.clone());
+    if let Some(plane) = plane {
+        env.insert("BITPLANE_PLANE_ID".into(), plane.into());
+        env.insert("BITPLANE_PLANE_DIR".into(), root.into());
     }
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());

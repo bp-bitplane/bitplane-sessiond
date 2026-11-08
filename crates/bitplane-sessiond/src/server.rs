@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitplane_protocol::DaemonInfo;
 use tokio::net::UnixListener;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::connection::{Shared, serve_connection};
 use crate::env::{self, EnvMap};
@@ -83,7 +83,7 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
     };
 
     let events = broadcast::channel(1024).0;
-    let registry = Registry::start(modules, &dirs.state, Arc::new(env), Events(events.clone()))?;
+    let registry = Registry::start(modules, &dirs, Arc::new(env), Events(events.clone()))?;
     let daemon = DaemonInfo {
         name: DAEMON_NAME.into(),
         version: DAEMON_VERSION.into(),
@@ -93,6 +93,7 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
         registry,
         daemon,
         events,
+        stop: Notify::new(),
     });
     tracing::info!(socket = %socket.display(), instance = %shared.daemon.instance, "listening");
 
@@ -115,8 +116,11 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
             }
             Some(_) = connections.join_next() => {}
             () = &mut shutdown => break,
+            () = shared.stop.notified() => break,
         }
     }
+    // A no-op after `daemon.shutdown`, which already shut the modules down.
+    shared.registry.shutdown(true);
     if bound_here {
         let _ = std::fs::remove_file(&socket);
     }

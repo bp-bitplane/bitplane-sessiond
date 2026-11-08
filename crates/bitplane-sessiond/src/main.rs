@@ -84,9 +84,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             runtime_dir,
             state_dir,
         } => {
-            let mut dirs = Dirs::for_host()?;
-            dirs.runtime = runtime_dir.unwrap_or(dirs.runtime);
-            dirs.state = state_dir.unwrap_or(dirs.state);
+            // Both given: the host's env may lack XDG_RUNTIME_DIR and TMPDIR.
+            let dirs = match (runtime_dir, state_dir) {
+                (Some(runtime), Some(state)) => Dirs { runtime, state },
+                (runtime, state) => {
+                    let host = Dirs::for_host()?;
+                    Dirs {
+                        runtime: runtime.unwrap_or(host.runtime),
+                        state: state.unwrap_or(host.state),
+                    }
+                }
+            };
             let config = Config {
                 dirs,
                 listener: activated_listener(),

@@ -4,8 +4,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitplane_protocol::{Capability, ErrorCode, Frame, Id, Notification, Response, RpcError};
@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::env::EnvMap;
+use crate::paths::Dirs;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -44,6 +45,10 @@ pub trait Module: Send + Sync + 'static {
 
     /// The connection closed; frames sent to it go nowhere from now on.
     fn disconnected(&self, _connection: u64) {}
+
+    /// The daemon is about to exit; `restore` says whether the next instance
+    /// brings this module's state back (ADR 0027). Called at most once.
+    fn shutdown(&self, _restore: bool) {}
 }
 
 pub struct Call {
@@ -69,6 +74,8 @@ pub struct Connection {
 }
 
 pub struct ModuleContext {
+    /// This instance's directories.
+    pub dirs: Dirs,
     /// `<state>/<namespace>/`, created before `start`.
     pub state_dir: std::path::PathBuf,
     /// The login-shell environment captured at startup; what sessions and
@@ -91,6 +98,7 @@ const FRAME_OWNER: &str = "session";
 
 pub struct Registry {
     entries: Vec<Entry>,
+    shut_down: AtomicBool,
 }
 
 struct Entry {
@@ -140,7 +148,7 @@ impl Bus {
 impl Registry {
     pub fn start(
         modules: Vec<Arc<dyn Module>>,
-        state_dir: &Path,
+        dirs: &Dirs,
         env: Arc<EnvMap>,
         events: Events,
     ) -> std::io::Result<Self> {
@@ -157,9 +165,10 @@ impl Registry {
                 .remove(module.namespace())
                 .expect("probed above");
             if let Availability::Available { .. } = availability {
-                let state_dir = state_dir.join(module.namespace());
+                let state_dir = dirs.state.join(module.namespace());
                 std::fs::create_dir_all(&state_dir)?;
                 module.start(ModuleContext {
+                    dirs: dirs.clone(),
                     state_dir,
                     env: env.clone(),
                     events: events.clone(),
@@ -171,7 +180,10 @@ impl Registry {
                 availability,
             });
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            shut_down: Default::default(),
+        })
     }
 
     pub fn capabilities(&self) -> Vec<Capability> {
@@ -230,6 +242,18 @@ impl Registry {
         for entry in &self.entries {
             if let Availability::Available { .. } = entry.availability {
                 entry.module.disconnected(connection);
+            }
+        }
+    }
+
+    /// Every available module's [`Module::shutdown`], once; later calls do nothing.
+    pub fn shutdown(&self, restore: bool) {
+        if self.shut_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for entry in &self.entries {
+            if let Availability::Available { .. } = entry.availability {
+                entry.module.shutdown(restore);
             }
         }
     }

@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 
 use rustix::fs::{FlockOperation, flock};
@@ -37,6 +37,29 @@ impl Pidfile {
         file.set_len(0).map_err(PidfileError::Io)?;
         writeln!(file, "{}", std::process::id()).map_err(PidfileError::Io)?;
         Ok(Self { _file: file })
+    }
+}
+
+/// Holds another instance's lock without claiming its pidfile, so that
+/// instance cannot start meanwhile. `None` while it runs.
+pub fn try_lock(path: &Path) -> io::Result<Option<File>> {
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+        Err(errno) => Err(errno.into()),
     }
 }
 
