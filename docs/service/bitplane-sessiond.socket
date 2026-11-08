@@ -1,0 +1,10 @@
+[Unit]
+Description=bitplane session daemon socket, protocol v1
+
+[Socket]
+ListenStream=%t/bitplane/sessiond/1/sessiond.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
