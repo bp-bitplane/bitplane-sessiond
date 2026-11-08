@@ -19,9 +19,22 @@ use tokio::sync::{mpsc, oneshot};
 type Pending = Arc<Mutex<Option<HashMap<Id, oneshot::Sender<Response>>>>>;
 
 pub struct Client {
+    handle: Handle,
+    streams: Streams,
+}
+
+/// The sending half of a [`Client`]: cheap to clone, so many tasks can call
+/// over one connection.
+#[derive(Clone)]
+pub struct Handle {
     outgoing: mpsc::UnboundedSender<Frame>,
     pending: Pending,
-    next_id: AtomicI64,
+    next_id: Arc<AtomicI64>,
+}
+
+/// The receiving half of a [`Client`]. Both streams end when the connection
+/// drops.
+pub struct Streams {
     events: mpsc::UnboundedReceiver<Notification>,
     frames: mpsc::UnboundedReceiver<Frame>,
 }
@@ -45,14 +58,59 @@ impl Client {
         tokio::spawn(write_frames(writer, to_write));
         tokio::spawn(read_frames(reader, pending.clone(), events_tx, frames_tx));
         Ok(Self {
-            outgoing,
-            pending,
-            next_id: AtomicI64::new(1),
-            events,
-            frames,
+            handle: Handle {
+                outgoing,
+                pending,
+                next_id: Arc::new(AtomicI64::new(1)),
+            },
+            streams: Streams { events, frames },
         })
     }
 
+    pub fn split(self) -> (Handle, Streams) {
+        (self.handle, self.streams)
+    }
+
+    pub async fn hello(&self, client: &str) -> Result<HelloResult, ClientError> {
+        self.handle.hello(client).await
+    }
+
+    pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, ClientError> {
+        self.handle.call(method, params).await
+    }
+
+    pub async fn request(&self, request: Request) -> Result<Response, ClientError> {
+        self.handle.request(request).await
+    }
+
+    pub fn notify(&self, method: &str, params: Option<Value>) {
+        self.handle.notify(method, params);
+    }
+
+    pub fn send_frame(&self, frame: Frame) {
+        self.handle.send_frame(frame);
+    }
+
+    pub async fn next_event(&mut self) -> Option<Notification> {
+        self.streams.next_event().await
+    }
+
+    pub async fn next_frame(&mut self) -> Option<Frame> {
+        self.streams.next_frame().await
+    }
+
+    /// Both streams at once, for loops that wait on either.
+    pub fn streams(
+        &mut self,
+    ) -> (
+        &mut mpsc::UnboundedReceiver<Notification>,
+        &mut mpsc::UnboundedReceiver<Frame>,
+    ) {
+        (&mut self.streams.events, &mut self.streams.frames)
+    }
+}
+
+impl Handle {
     pub async fn hello(&self, client: &str) -> Result<HelloResult, ClientError> {
         let params = HelloParams {
             protocol_version: PROTOCOL_VERSION,
@@ -97,27 +155,19 @@ impl Client {
         let _ = self.outgoing.send(frame);
     }
 
+    fn send_json(&self, message: &impl serde::Serialize) {
+        let bytes = serde_json::to_vec(message).expect("protocol messages serialize");
+        let _ = self.outgoing.send(Frame::Json(bytes));
+    }
+}
+
+impl Streams {
     pub async fn next_event(&mut self) -> Option<Notification> {
         self.events.recv().await
     }
 
     pub async fn next_frame(&mut self) -> Option<Frame> {
         self.frames.recv().await
-    }
-
-    /// Both streams at once, for loops that wait on either.
-    pub fn streams(
-        &mut self,
-    ) -> (
-        &mut mpsc::UnboundedReceiver<Notification>,
-        &mut mpsc::UnboundedReceiver<Frame>,
-    ) {
-        (&mut self.events, &mut self.frames)
-    }
-
-    fn send_json(&self, message: &impl serde::Serialize) {
-        let bytes = serde_json::to_vec(message).expect("protocol messages serialize");
-        let _ = self.outgoing.send(Frame::Json(bytes));
     }
 }
 

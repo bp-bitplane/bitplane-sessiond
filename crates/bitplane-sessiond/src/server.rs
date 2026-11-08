@@ -97,6 +97,8 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
     tracing::info!(socket = %socket.display(), instance = %shared.daemon.instance, "listening");
 
     let next_id = AtomicU64::new(1);
+    // Dropped on shutdown, which closes every connection with it.
+    let mut connections = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -105,12 +107,13 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
                 match stream.peer_cred() {
                     Ok(cred) if cred.uid() == peer_uid => {
                         let id = next_id.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn(serve_connection(stream, id, shared.clone()));
+                        connections.spawn(serve_connection(stream, id, shared.clone()));
                     }
                     Ok(cred) => tracing::warn!(uid = cred.uid(), "refused a connection from another uid"),
                     Err(error) => tracing::warn!(%error, "refused a connection without peer credentials"),
                 }
             }
+            Some(_) = connections.join_next() => {}
             () = &mut shutdown => break,
         }
     }
