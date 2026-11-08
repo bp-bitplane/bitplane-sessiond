@@ -8,3 +8,9 @@ edition = "2024"
 license = "MIT"
 authors = ["Denis Homolík"]
 repository = "https://github.com/bp-bitplane/bitplane-sessiond"
+
+# ghostty's Debug build checks page integrity on every scroll, which makes a
+# busy session crawl; tests and dev builds link the release engine.
+[profile.dev.package.libghostty-vt-sys]
+debug = false
+opt-level = 3

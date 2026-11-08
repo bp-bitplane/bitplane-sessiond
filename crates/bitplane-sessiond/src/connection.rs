@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::module::{Call, Connection, Registry};
+use crate::module::{Call, Connection, Registry, Reply};
 
 pub struct Shared {
     pub registry: Registry,
@@ -75,6 +75,7 @@ pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) 
     if let Some(forwarder) = forwarder {
         forwarder.abort();
     }
+    shared.registry.disconnected(id);
     drop(connection);
     // Let a final error reply reach the client before the socket closes.
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
@@ -137,21 +138,15 @@ fn handle_message(bytes: &[u8], connection: &Connection, shared: &Arc<Shared>) {
         return;
     }
     let shared = shared.clone();
+    let reply = Reply::new(id, connection.frames.clone());
     let call = Call {
         method,
         params,
         connection: connection.clone(),
+        reply: reply.clone(),
     };
     tokio::spawn(async move {
-        let connection = call.connection.clone();
-        let outcome = shared.registry.dispatch(call).await;
-        if let Some(id) = id {
-            let response = match outcome {
-                Ok(result) => Response::ok(id, result),
-                Err(error) => Response::err(Some(id), error),
-            };
-            send(&connection, &response);
-        }
+        reply.send(shared.registry.dispatch(call).await);
     });
 }
 

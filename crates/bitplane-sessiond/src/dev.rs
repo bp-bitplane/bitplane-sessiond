@@ -1,8 +1,9 @@
 //! `bitplane-sessiond dev`: a small client for poking a running daemon.
 
-use bitplane_protocol::Frame;
+use bitplane_protocol::{Frame, Notification, method};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::client::{Client, ClientError};
 
@@ -20,22 +21,25 @@ pub async fn events(client: &mut Client, mut out: impl AsyncWrite + Unpin) -> st
 }
 
 /// Bridges `input` and `output` to one attachment of `session` until the
-/// user types [`DETACH`], the daemon reports an error, or it hangs up.
+/// user types [`DETACH`], the session goes away, or the daemon hangs up.
+/// Each size from `resizes` resizes the attachment.
 pub async fn attach(
     client: &mut Client,
     session: &str,
     (cols, rows): (u16, u16),
+    mut resizes: mpsc::UnboundedReceiver<(u16, u16)>,
     mut input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> Result<(), ClientError> {
     let opened = client
         .call(
-            "session.attachment.open",
+            method::SESSION_ATTACHMENT_OPEN,
             Some(json!({ "session": session, "cols": cols, "rows": rows })),
         )
         .await?;
     let attachment = opened["attachment"].as_u64().ok_or(ClientError::Closed)? as u32;
 
+    let mut drawn = 0u64;
     let mut buf = [0u8; 4096];
     loop {
         let (events, frames) = client.streams();
@@ -55,24 +59,38 @@ pub async fn attach(
                     break;
                 }
             }
-            frame = frames.recv() => match frame {
-                Some(Frame::Snapshot { attachment: a, data, .. } | Frame::Output { attachment: a, data, .. })
-                    if a == attachment =>
-                {
-                    if output.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    let _ = output.flush().await;
+            Some((cols, rows)) = resizes.recv() => {
+                let _ = client
+                    .call(
+                        method::SESSION_ATTACHMENT_RESIZE,
+                        Some(json!({ "attachment": attachment, "cols": cols, "rows": rows })),
+                    )
+                    .await;
+            }
+            frame = frames.recv() => {
+                let (data, snapshot) = match frame {
+                    Some(Frame::Snapshot { attachment: a, data, .. }) if a == attachment => (data, true),
+                    Some(Frame::Output { attachment: a, data, .. }) if a == attachment => (data, false),
+                    Some(_) => continue,
+                    None => return Err(ClientError::Closed),
+                };
+                if snapshot && output.write_all(CLEAR).await.is_err() {
+                    break;
                 }
-                Some(_) => {}
-                None => return Err(ClientError::Closed),
-            },
+                if output.write_all(&data).await.is_err() {
+                    break;
+                }
+                let _ = output.flush().await;
+                drawn += data.len() as u64;
+                client.notify(
+                    method::SESSION_ATTACHMENT_ACK,
+                    Some(json!({ "attachment": attachment, "bytes": drawn })),
+                );
+            }
             event = events.recv() => match event {
-                Some(event) if event.method == "session.attachment.error"
-                    && event.params.as_ref().and_then(|p| p["attachment"].as_u64()) == Some(attachment.into()) =>
-                {
+                Some(event) if ends(&event, session, attachment) => {
                     let message = event.params.as_ref().and_then(|p| p["message"].as_str()).unwrap_or("");
-                    tracing::warn!(message, "attachment error");
+                    tracing::warn!(method = event.method, message, "attachment ended");
                     break;
                 }
                 Some(_) => {}
@@ -82,9 +100,23 @@ pub async fn attach(
     }
     let _ = client
         .call(
-            "session.attachment.close",
+            method::SESSION_ATTACHMENT_CLOSE,
             Some(json!({ "attachment": attachment })),
         )
         .await;
     Ok(())
+}
+
+/// Clears the screen and its scrollback before a snapshot redraws it.
+const CLEAR: &[u8] = b"\x1b[H\x1b[2J\x1b[3J";
+
+fn ends(event: &Notification, session: &str, attachment: u32) -> bool {
+    let params = event.params.as_ref();
+    match event.method.as_str() {
+        method::SESSION_ATTACHMENT_ERROR => {
+            params.and_then(|p| p["attachment"].as_u64()) == Some(attachment.into())
+        }
+        method::SESSION_REMOVED => params.and_then(|p| p["session"].as_str()) == Some(session),
+        _ => false,
+    }
 }

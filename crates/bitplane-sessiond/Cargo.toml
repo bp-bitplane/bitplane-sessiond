@@ -8,9 +8,11 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "4ba2d1ad8415432d5ca6095fb3bea7ba0fc636c8" }
+bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "003b6cbbede9ac69d7550986ab576118b7f13b66" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+libghostty-vt = "=0.2.2"
+portable-pty = "0.9"
 rustix = { version = "1", features = ["fs", "process", "termios"] }
 serde = "1"
 serde_json = "1"

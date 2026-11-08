@@ -7,6 +7,7 @@ use bitplane_sessiond::autostart::connect_or_start;
 use bitplane_sessiond::client::Client;
 use bitplane_sessiond::paths::Dirs;
 use bitplane_sessiond::server::{Config, serve};
+use bitplane_sessiond::session::Sessions;
 use bitplane_sessiond::{DAEMON_NAME, dev};
 use clap::{Parser, Subcommand};
 
@@ -90,7 +91,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 dirs,
                 listener: activated_listener(),
                 peer_uid: rustix::process::getuid().as_raw(),
-                modules: Vec::new(),
+                modules: vec![Sessions::module()],
                 env: None,
             };
             serve(config, shutdown_signal()).await?;
@@ -115,14 +116,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 DevCommand::Events => dev::events(&mut client, tokio::io::stdout()).await?,
                 DevCommand::Attach { session } => {
-                    let size = rustix::termios::tcgetwinsize(std::io::stdin().as_fd())
-                        .map(|size| (size.ws_col, size.ws_row))
-                        .unwrap_or((80, 24));
+                    let size = terminal_size().unwrap_or((80, 24));
                     let _raw = RawMode::enter();
                     dev::attach(
                         &mut client,
                         &session,
                         size,
+                        window_changes()?,
                         tokio::io::stdin(),
                         tokio::io::stdout(),
                     )
@@ -141,6 +141,29 @@ fn activated_listener() -> Option<std::os::unix::net::UnixListener> {
     (pid == std::process::id() && fds >= 1)
         // SAFETY: the service manager hands us fd 3 for exactly this use.
         .then(|| unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) })
+}
+
+fn terminal_size() -> Option<(u16, u16)> {
+    rustix::termios::tcgetwinsize(std::io::stdin().as_fd())
+        .ok()
+        .map(|size| (size.ws_col, size.ws_row))
+}
+
+/// The terminal's size after every SIGWINCH.
+fn window_changes() -> std::io::Result<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut winch = signal(SignalKind::window_change())?;
+    let (sizes, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while winch.recv().await.is_some() {
+            if let Some(size) = terminal_size()
+                && sizes.send(size).is_err()
+            {
+                return;
+            }
+        }
+    });
+    Ok(received)
 }
 
 async fn shutdown_signal() {

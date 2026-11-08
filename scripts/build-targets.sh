@@ -30,14 +30,15 @@ for target in "$@"; do
 	case "$target" in
 	*-linux-gnu)
 		require_zig
-		cargo zigbuild --locked --release --target "$target.$GLIBC_FLOOR"
+		scripts/build-env.sh cargo zigbuild --locked --release --target "$target.$GLIBC_FLOOR"
 		;;
 	*-linux-musl)
 		require_zig
-		cargo zigbuild --locked --release --target "$target"
+		scripts/build-env.sh cargo zigbuild --locked --release --target "$target"
 		;;
 	*-apple-darwin)
-		cargo build --locked --release --target "$target"
+		require_zig
+		scripts/build-env.sh cargo build --locked --release --target "$target"
 		;;
 	*)
 		echo "not a bootstrap target: $target" >&2
