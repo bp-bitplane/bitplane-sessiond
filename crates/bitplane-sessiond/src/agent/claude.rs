@@ -3,11 +3,15 @@
 //! (ADR 0030).
 
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use bitplane_protocol::agent::WaitingReason;
+use bitplane_protocol::agent::{AgentError, AgentState, WaitingReason};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{AgentAdapter, AgentEvent, Ingested, LiveAgent};
@@ -29,6 +33,8 @@ pub const HOOK_EVENTS: &[&str] = &[
 /// Claude Code's own cap on each hook, in seconds; the forwarder gives up
 /// well before it.
 const HOOK_TIMEOUT_SECS: u64 = 2;
+/// `claude agents --json` takes ~0.1 s; a hung one is given up on.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const BIN_DIR: &str = "bin";
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -102,9 +108,15 @@ impl AgentAdapter for Claude {
             },
             "Stop" => AgentEvent::Idle { error: None },
             "StopFailure" => AgentEvent::Idle {
-                error: payload.get("error").map(|error| match error {
-                    Value::String(text) => text.clone(),
-                    other => other.to_string(),
+                error: Some(AgentError {
+                    error: match payload.get("error") {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(other) => other.to_string(),
+                        None => "unknown".into(),
+                    },
+                    message: field("last_assistant_message")
+                        .or(field("error_details"))
+                        .map(String::from),
                 }),
             },
             "SessionEnd" => AgentEvent::Ended {
@@ -118,8 +130,16 @@ impl AgentAdapter for Claude {
         })
     }
 
-    fn probe(&self) -> Vec<LiveAgent> {
-        Vec::new()
+    fn probe(&self, env: &EnvMap) -> Option<Vec<LiveAgent>> {
+        let path = env.get("PATH").map(String::as_str).unwrap_or_default();
+        let claude = find(OsStr::new(path), None)?;
+        let mut command = Command::new(claude);
+        command
+            .args(["agents", "--json"])
+            .env_clear()
+            .envs(env.iter().filter(|(key, _)| *key != "CLAUDECODE"))
+            .current_dir(env.get("HOME").map_or("/", String::as_str));
+        parse_registry(&output(command, PROBE_TIMEOUT)?)
     }
 
     fn resume_command(&self, agent_session: &str) -> String {
@@ -146,6 +166,52 @@ pub fn find(path: &OsStr, own: Option<&Path>) -> Option<PathBuf> {
                     .is_some_and(|name| name.starts_with(crate::DAEMON_NAME));
             executable && !wrapper
         })
+}
+
+/// `claude agents --json`: every Claude Code on the host. `pid` and `status`
+/// are there only while the process lives, `sessionId` and `name` only once
+/// set; entries without a pid are left out.
+pub fn parse_registry(json: &[u8]) -> Option<Vec<LiveAgent>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        pid: Option<u32>,
+        session_id: Option<String>,
+        name: Option<String>,
+        #[serde(default)]
+        cwd: String,
+        kind: Option<String>,
+        status: Option<String>,
+        waiting_for: Option<String>,
+    }
+    let entries: Vec<Value> = serde_json::from_slice(json).ok()?;
+    Some(
+        entries
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value::<Entry>(entry).ok())
+            .filter_map(|entry| {
+                Some(LiveAgent {
+                    pid: entry.pid?,
+                    agent_session: entry.session_id,
+                    name: entry.name.filter(|name| !name.is_empty()),
+                    cwd: entry.cwd,
+                    state: match entry.status?.as_str() {
+                        "busy" => Some(AgentState::Busy),
+                        "idle" => Some(AgentState::Idle),
+                        "waiting" => Some(AgentState::Waiting {
+                            reason: match entry.waiting_for.as_deref() {
+                                Some("permission prompt") => WaitingReason::Permission,
+                                Some("input needed") => WaitingReason::Input,
+                                _ => WaitingReason::Other,
+                            },
+                        }),
+                        _ => None,
+                    },
+                    background: entry.kind.as_deref() == Some("background"),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// A `command` hook on every event in [`HOOK_EVENTS`], running `exe hook`.
@@ -179,6 +245,40 @@ pub fn merge(user: Value, ours: &Value) -> Option<Value> {
             .extend(groups.as_array()?.iter().cloned());
     }
     Some(Value::Object(merged))
+}
+
+/// `command`'s stdout when it succeeds within `timeout`; it is killed otherwise.
+fn output(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (done, read) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = done.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
+    });
+    let bytes = read
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .and_then(Result::ok);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return bytes.filter(|_| status.success()),
+            Ok(None) if bytes.is_some() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 fn shell_quote(text: &str) -> String {
@@ -223,6 +323,82 @@ mod tests {
         assert_eq!(
             merged["hooks"]["SessionStart"],
             ours["hooks"]["SessionStart"]
+        );
+    }
+
+    #[test]
+    fn the_registry_lists_live_agents_only() {
+        let json = br#"[
+            {"id":"b1","cwd":"/old","kind":"background","startedAt":1,"sessionId":"s0","state":"done"},
+            {"pid":11,"cwd":"/a","kind":"interactive","startedAt":1,"sessionId":"s1","name":"web-fix","status":"busy"},
+            {"pid":12,"cwd":"/b","kind":"interactive","startedAt":1,"status":"waiting","waitingFor":"input needed"},
+            {"pid":13,"cwd":"/c","kind":"interactive","startedAt":1,"status":"waiting","waitingFor":"sandbox request"},
+            {"pid":14,"cwd":"/d","kind":"background","startedAt":1,"sessionId":"s4","status":"idle","state":"running"},
+            {"pid":15,"cwd":"/e","kind":"interactive","startedAt":1,"status":"pondering"},
+            {"pid":"bad"}
+        ]"#;
+
+        let live = parse_registry(json).unwrap();
+
+        let summary: Vec<_> = live
+            .iter()
+            .map(|agent| {
+                (
+                    agent.pid,
+                    agent.agent_session.as_deref(),
+                    agent.state.clone(),
+                    agent.background,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (11, Some("s1"), Some(AgentState::Busy), false),
+                (
+                    12,
+                    None,
+                    Some(AgentState::Waiting {
+                        reason: WaitingReason::Input
+                    }),
+                    false
+                ),
+                (
+                    13,
+                    None,
+                    Some(AgentState::Waiting {
+                        reason: WaitingReason::Other
+                    }),
+                    false
+                ),
+                (14, Some("s4"), Some(AgentState::Idle), true),
+                (15, None, None, false),
+            ]
+        );
+        assert_eq!(live[0].name.as_deref(), Some("web-fix"));
+        assert!(parse_registry(b"not json").is_none());
+    }
+
+    #[test]
+    fn a_stop_failure_carries_the_error_and_what_claude_showed() {
+        let ingested = Claude
+            .ingest(&json!({
+                "hook_event_name": "StopFailure",
+                "session_id": "a1",
+                "error": "rate_limit",
+                "error_details": "429 Too Many Requests",
+                "last_assistant_message": "API Error: Rate limit reached",
+            }))
+            .unwrap();
+
+        assert_eq!(
+            ingested.event,
+            AgentEvent::Idle {
+                error: Some(AgentError {
+                    error: "rate_limit".into(),
+                    message: Some("API Error: Rate limit reached".into()),
+                })
+            }
         );
     }
 
