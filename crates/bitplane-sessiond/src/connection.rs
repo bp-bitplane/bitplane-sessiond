@@ -5,21 +5,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitplane_protocol::{
-    DaemonInfo, ErrorCode, Frame, HelloParams, HelloResult, Id, MIN_PROTOCOL_VERSION, Message,
-    Notification, PROTOCOL_VERSION, Request, Response, RpcError, decode_envelope, hello::negotiate,
-    method,
+    DaemonInfo, DaemonShutdownParams, ErrorCode, Frame, HelloParams, HelloResult, Id,
+    MIN_PROTOCOL_VERSION, Message, Notification, PROTOCOL_VERSION, Request, Response, RpcError,
+    decode_envelope, hello::negotiate, method,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 
-use crate::module::{Call, Connection, Registry};
+use crate::module::{Call, Connection, Registry, Reply};
 
 pub struct Shared {
     pub registry: Registry,
     pub daemon: DaemonInfo,
     pub events: broadcast::Sender<Notification>,
+    /// Set after `daemon.shutdown` is answered; the daemon then exits.
+    pub stop: Notify,
 }
 
 pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) {
@@ -29,6 +31,7 @@ pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) 
     let connection = Connection { id, frames };
 
     let mut forwarder = None;
+    let mut stopping = false;
     let mut buf = Vec::with_capacity(8192);
     'read: loop {
         loop {
@@ -56,7 +59,12 @@ pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) 
                         break 'read;
                     }
                 },
-                (Frame::Json(bytes), true) => handle_message(&bytes, &connection, &shared),
+                (Frame::Json(bytes), true) => {
+                    if handle_message(&bytes, &connection, &shared) == Handled::Shutdown {
+                        stopping = true;
+                        break 'read;
+                    }
+                }
                 (Frame::Input { attachment, data }, true) => {
                     shared.registry.input(&connection, attachment, data)
                 }
@@ -75,9 +83,20 @@ pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) 
     if let Some(forwarder) = forwarder {
         forwarder.abort();
     }
+    shared.registry.disconnected(id);
     drop(connection);
     // Let a final error reply reach the client before the socket closes.
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+    if stopping {
+        shared.stop.notify_one();
+    }
+}
+
+#[derive(PartialEq)]
+enum Handled {
+    Dispatched,
+    /// `daemon.shutdown` was answered; the connection closes and the daemon exits.
+    Shutdown,
 }
 
 /// The reply to the connection's first message: `Ok` opens the connection,
@@ -119,14 +138,17 @@ fn hello(bytes: &[u8], shared: &Shared) -> Result<Response, Response> {
     ))
 }
 
-fn handle_message(bytes: &[u8], connection: &Connection, shared: &Arc<Shared>) {
+fn handle_message(bytes: &[u8], connection: &Connection, shared: &Arc<Shared>) -> Handled {
     let (id, method, params) = match serde_json::from_slice::<Message>(bytes) {
         Ok(Message::Request(Request {
             id, method, params, ..
         })) => (Some(id), method, params),
         Ok(Message::Notification(Notification { method, params, .. })) => (None, method, params),
-        Ok(Message::Response(_)) => return,
-        Err(error) => return send(connection, &parse_error(error)),
+        Ok(Message::Response(_)) => return Handled::Dispatched,
+        Err(error) => {
+            send(connection, &parse_error(error));
+            return Handled::Dispatched;
+        }
     };
     if method == method::HELLO {
         let error =
@@ -134,25 +156,38 @@ fn handle_message(bytes: &[u8], connection: &Connection, shared: &Arc<Shared>) {
         if let Some(id) = id {
             send(connection, &Response::err(Some(id), error));
         }
-        return;
+        return Handled::Dispatched;
+    }
+    if method == method::DAEMON_SHUTDOWN {
+        let parsed = serde_json::from_value::<DaemonShutdownParams>(params.unwrap_or_default());
+        let DaemonShutdownParams { restore } = match parsed {
+            Ok(params) => params,
+            Err(error) => {
+                if let Some(id) = id {
+                    send(connection, &invalid_params(id, &error.to_string()));
+                }
+                return Handled::Dispatched;
+            }
+        };
+        tracing::info!(restore, "shutting down on request");
+        shared.registry.shutdown(restore);
+        if let Some(id) = id {
+            send(connection, &Response::ok(id, json!({})));
+        }
+        return Handled::Shutdown;
     }
     let shared = shared.clone();
+    let reply = Reply::new(id, connection.frames.clone());
     let call = Call {
         method,
         params,
         connection: connection.clone(),
+        reply: reply.clone(),
     };
     tokio::spawn(async move {
-        let connection = call.connection.clone();
-        let outcome = shared.registry.dispatch(call).await;
-        if let Some(id) = id {
-            let response = match outcome {
-                Ok(result) => Response::ok(id, result),
-                Err(error) => Response::err(Some(id), error),
-            };
-            send(&connection, &response);
-        }
+        reply.send(shared.registry.dispatch(call).await);
     });
+    Handled::Dispatched
 }
 
 async fn forward_events(mut events: broadcast::Receiver<Notification>, connection: Connection) {

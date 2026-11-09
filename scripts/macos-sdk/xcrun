@@ -1,0 +1,34 @@
+#!/bin/sh
+# Zig 0.15.2's linker breaks against macOS SDK 26.4 and later, and Zig asks
+# xcrun for the SDK, ignoring SDKROOT. On PATH ahead of /usr/bin, this answers
+# with BITPLANE_MACOS_SDK or the newest installed SDK older than 26.4.
+set -eu
+
+sdk_path() {
+	if [ -n "${BITPLANE_MACOS_SDK:-}" ]; then
+		echo "$BITPLANE_MACOS_SDK"
+		return
+	fi
+	for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX*.*.sdk \
+		/Applications/Xcode*.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX*.*.sdk; do
+		[ -d "$sdk" ] || continue
+		version="${sdk##*/MacOSX}"
+		version="${version%.sdk}"
+		echo "$version $sdk"
+	done | awk '{ split($1, v, "."); n = v[1] * 100 + v[2]; if (n < 2604 && n > best) { best = n; path = $2 } }
+		END { if (path == "") exit 1; print path }'
+}
+
+case " $* " in
+*" --show-sdk-path "*)
+	sdk_path || { echo "xcrun shim: no macOS SDK older than 26.4 is installed" >&2; exit 1; }
+	;;
+*" --show-sdk-version "*)
+	path="$(sdk_path)"
+	version="${path##*/MacOSX}"
+	echo "${version%.sdk}"
+	;;
+*)
+	exec /usr/bin/xcrun "$@"
+	;;
+esac

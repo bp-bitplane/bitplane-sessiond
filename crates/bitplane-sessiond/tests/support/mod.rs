@@ -12,6 +12,7 @@ use bitplane_sessiond::env::EnvMap;
 use bitplane_sessiond::module::{Availability, BoxFuture, Call, Module};
 use bitplane_sessiond::paths::Dirs;
 use bitplane_sessiond::server::{Config, ServeError, serve};
+use bitplane_sessiond::session::Sessions;
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -173,4 +174,250 @@ impl Module for Echo {
             }
         })
     }
+}
+
+/// What sessions are spawned with: `/bin/sh` and a `HOME` of its own, so no
+/// profile of the host's runs.
+pub fn shell_env(home: &std::path::Path) -> EnvMap {
+    EnvMap::from([
+        ("SHELL".into(), "/bin/sh".into()),
+        ("HOME".into(), home.display().to_string()),
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("PS1".into(), "$ ".into()),
+    ])
+}
+
+/// One attachment's stream as a client sees it: the snapshot, then output
+/// checked to continue exactly from it, acknowledged as it is drawn.
+pub struct Screen {
+    pub attachment: u32,
+    pub snapshot_offset: u64,
+    /// Snapshot and output bytes, in order.
+    pub data: Vec<u8>,
+    /// The session offset the next OUTPUT frame must start at.
+    pub next_offset: u64,
+    /// SNAPSHOT frames after the first: each one restarts the stream.
+    pub resnapshots: u32,
+    snapshot_len: usize,
+    drawn: u64,
+    stalled: bool,
+}
+
+impl Screen {
+    /// Waits for the attachment's SNAPSHOT, which must be its first frame.
+    pub async fn attach(client: &mut Client, session: &str) -> Self {
+        Self::attach_with(
+            client,
+            serde_json::json!({ "session": session, "cols": 80, "rows": 24 }),
+        )
+        .await
+    }
+
+    /// Attaches with `session.attachment.open` params of the test's own.
+    pub async fn attach_with(client: &mut Client, params: Value) -> Self {
+        let opened = client
+            .call("session.attachment.open", Some(params))
+            .await
+            .unwrap();
+        let attachment = opened["attachment"].as_u64().unwrap() as u32;
+        let frame = next_frame(client).await;
+        let bitplane_protocol::Frame::Snapshot {
+            attachment: a,
+            offset,
+            data,
+        } = frame
+        else {
+            panic!("expected a SNAPSHOT first, got {frame:?}")
+        };
+        assert_eq!(a, attachment);
+        let mut screen = Screen {
+            attachment,
+            snapshot_offset: offset,
+            next_offset: offset,
+            snapshot_len: data.len(),
+            drawn: 0,
+            data: Vec::new(),
+            resnapshots: 0,
+            stalled: false,
+        };
+        screen.draw(client, &data);
+        screen
+    }
+
+    pub fn type_text(&self, client: &Client, text: &str) {
+        client.send_frame(bitplane_protocol::Frame::Input {
+            attachment: self.attachment,
+            data: text.as_bytes().to_vec(),
+        });
+    }
+
+    /// Closes the attachment and drops the frames it was sent before the reply,
+    /// which the client has already read.
+    pub async fn close(self, client: &mut Client) {
+        client
+            .call(
+                "session.attachment.close",
+                Some(serde_json::json!({ "attachment": self.attachment })),
+            )
+            .await
+            .unwrap();
+        while let Ok(frame) = client.streams().1.try_recv() {
+            assert!(
+                matches!(
+                    frame,
+                    bitplane_protocol::Frame::Output { attachment, .. }
+                        | bitplane_protocol::Frame::Snapshot { attachment, .. }
+                        if attachment == self.attachment
+                ),
+                "unexpected frame {frame:?}"
+            );
+        }
+    }
+
+    /// Reads OUTPUT until the stream contains `needle`.
+    pub async fn wait_for(&mut self, client: &mut Client, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // Only the new bytes are searched, so a long stream stays cheap to follow.
+        let mut from = 0;
+        while !contains(&self.data[from..], needle.as_bytes()) {
+            from = self.data.len().saturating_sub(needle.len());
+            let frame = tokio::time::timeout_at(deadline, client.next_frame())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("no {needle:?} in {:?}", String::from_utf8_lossy(&self.data))
+                })
+                .expect("connection open");
+            let resnapshots = self.resnapshots;
+            self.take(client, frame);
+            if self.resnapshots != resnapshots {
+                from = 0;
+            }
+        }
+    }
+
+    pub fn take(&mut self, client: &Client, frame: bitplane_protocol::Frame) {
+        match frame {
+            bitplane_protocol::Frame::Output {
+                attachment,
+                offset,
+                data,
+            } if attachment == self.attachment => {
+                assert_eq!(offset, self.next_offset, "OUTPUT must continue the stream");
+                self.next_offset += data.len() as u64;
+                self.draw(client, &data);
+            }
+            bitplane_protocol::Frame::Snapshot {
+                attachment,
+                offset,
+                data,
+            } if attachment == self.attachment => {
+                self.resnapshots += 1;
+                self.snapshot_offset = offset;
+                self.next_offset = offset;
+                self.snapshot_len = data.len();
+                self.data.clear();
+                self.draw(client, &data);
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    /// Reads frames until none arrives for a while.
+    pub async fn drain(&mut self, client: &mut Client) {
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), client.next_frame()).await
+        {
+            self.take(client, frame);
+        }
+    }
+
+    /// Stops acknowledging what is drawn, as a client that went to sleep.
+    pub fn stall(&mut self) {
+        self.stalled = true;
+    }
+
+    /// Acknowledges everything drawn so far and keeps acknowledging.
+    pub fn resume(&mut self, client: &Client) {
+        self.stalled = false;
+        self.ack(client);
+    }
+
+    /// The OUTPUT bytes, without the snapshot.
+    pub fn output(&self) -> &[u8] {
+        &self.data[self.snapshot_len..]
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.data).into_owned()
+    }
+
+    fn draw(&mut self, client: &Client, data: &[u8]) {
+        self.data.extend_from_slice(data);
+        self.drawn += data.len() as u64;
+        if !self.stalled {
+            self.ack(client);
+        }
+    }
+
+    fn ack(&self, client: &Client) {
+        client.notify(
+            "session.attachment.ack",
+            Some(serde_json::json!({ "attachment": self.attachment, "bytes": self.drawn })),
+        );
+    }
+}
+
+pub async fn next_frame(client: &mut Client) -> bitplane_protocol::Frame {
+    tokio::time::timeout(Duration::from_secs(10), client.next_frame())
+        .await
+        .expect("a frame arrives")
+        .expect("connection open")
+}
+
+/// Shell commands for `chunks` bursts of 1500 numbered lines, 20 ms apart:
+/// `<prefix><chunk> <line>`. Each burst is written in large pieces, and a
+/// client that acks what it draws keeps up with it.
+pub fn paced_lines(prefix: &str, chunks: u32) -> String {
+    format!(
+        "for i in $(seq 1 {chunks}); do seq 1 1500 | sed \"s/^/{prefix}$i /\" | cat; sleep 0.02; done"
+    )
+}
+
+pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+pub async fn open(client: &Client, params: Value) -> Value {
+    let result = client.call("session.open", Some(params)).await.unwrap();
+    result["session"].clone()
+}
+
+pub async fn sessions_daemon() -> (tempfile::TempDir, TestDaemon) {
+    let home = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start_with_env(vec![Sessions::module()], shell_env(home.path())).await;
+    (home, daemon)
+}
+
+pub async fn next_event(client: &mut Client, method: &str) -> Value {
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), client.next_event())
+            .await
+            .unwrap_or_else(|_| panic!("no {method} event"))
+            .expect("connection open");
+        if event.method == method {
+            return event.params.unwrap_or_default();
+        }
+    }
+}
+
+pub async fn wait_until(done: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out");
 }

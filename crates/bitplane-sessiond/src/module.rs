@@ -4,15 +4,16 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use bitplane_protocol::{Capability, ErrorCode, Frame, Notification, RpcError};
+use bitplane_protocol::{Capability, ErrorCode, Frame, Id, Notification, Response, RpcError};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::env::EnvMap;
+use crate::paths::Dirs;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -41,12 +42,28 @@ pub trait Module: Send + Sync + 'static {
 
     /// An INPUT frame for one of this module's attachments.
     fn input(&self, _connection: &Connection, _attachment: u32, _data: Vec<u8>) {}
+
+    /// The connection closed; frames sent to it go nowhere from now on.
+    fn disconnected(&self, _connection: u64) {}
+
+    /// The daemon is about to exit; `restore` says whether the next instance
+    /// brings this module's state back (ADR 0027). Called at most once.
+    fn shutdown(&self, _restore: bool) {}
 }
 
 pub struct Call {
     pub method: String,
     pub params: Option<Value>,
     pub connection: Connection,
+    pub reply: Reply,
+}
+
+/// The reply to one request. The connection sends the handler's result
+/// unless the handler sent it first, so frames sent after it follow it.
+#[derive(Clone)]
+pub struct Reply {
+    id: Arc<Mutex<Option<Id>>>,
+    frames: mpsc::UnboundedSender<Frame>,
 }
 
 /// The connection a call or frame came from. Frames sent here reach only it.
@@ -57,6 +74,8 @@ pub struct Connection {
 }
 
 pub struct ModuleContext {
+    /// This instance's directories.
+    pub dirs: Dirs,
     /// `<state>/<namespace>/`, created before `start`.
     pub state_dir: std::path::PathBuf,
     /// The login-shell environment captured at startup; what sessions and
@@ -79,11 +98,35 @@ const FRAME_OWNER: &str = "session";
 
 pub struct Registry {
     entries: Vec<Entry>,
+    shut_down: AtomicBool,
 }
 
 struct Entry {
     module: Arc<dyn Module>,
     availability: Availability,
+}
+
+impl Reply {
+    /// `id` is `None` for a notification, which gets no reply.
+    pub fn new(id: Option<Id>, frames: mpsc::UnboundedSender<Frame>) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(id)),
+            frames,
+        }
+    }
+
+    /// Sends the reply unless it was sent already.
+    pub fn send(&self, outcome: Result<Value, RpcError>) {
+        let Some(id) = self.id.lock().unwrap().take() else {
+            return;
+        };
+        let response = match outcome {
+            Ok(result) => Response::ok(id, result),
+            Err(error) => Response::err(Some(id), error),
+        };
+        let bytes = serde_json::to_vec(&response).expect("protocol messages serialize");
+        let _ = self.frames.send(Frame::Json(bytes));
+    }
 }
 
 impl Events {
@@ -105,7 +148,7 @@ impl Bus {
 impl Registry {
     pub fn start(
         modules: Vec<Arc<dyn Module>>,
-        state_dir: &Path,
+        dirs: &Dirs,
         env: Arc<EnvMap>,
         events: Events,
     ) -> std::io::Result<Self> {
@@ -122,9 +165,10 @@ impl Registry {
                 .remove(module.namespace())
                 .expect("probed above");
             if let Availability::Available { .. } = availability {
-                let state_dir = state_dir.join(module.namespace());
+                let state_dir = dirs.state.join(module.namespace());
                 std::fs::create_dir_all(&state_dir)?;
                 module.start(ModuleContext {
+                    dirs: dirs.clone(),
                     state_dir,
                     env: env.clone(),
                     events: events.clone(),
@@ -136,7 +180,10 @@ impl Registry {
                 availability,
             });
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            shut_down: Default::default(),
+        })
     }
 
     pub fn capabilities(&self) -> Vec<Capability> {
@@ -188,6 +235,26 @@ impl Registry {
                 && matches!(entry.availability, Availability::Available { .. })
         }) {
             entry.module.input(connection, attachment, data);
+        }
+    }
+
+    pub fn disconnected(&self, connection: u64) {
+        for entry in &self.entries {
+            if let Availability::Available { .. } = entry.availability {
+                entry.module.disconnected(connection);
+            }
+        }
+    }
+
+    /// Every available module's [`Module::shutdown`], once; later calls do nothing.
+    pub fn shutdown(&self, restore: bool) {
+        if self.shut_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for entry in &self.entries {
+            if let Availability::Available { .. } = entry.availability {
+                entry.module.shutdown(restore);
+            }
         }
     }
 

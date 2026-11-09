@@ -1,59 +1,72 @@
 mod support;
 
-use std::sync::{Arc, OnceLock};
-
-use bitplane_protocol::{Frame, RpcError};
 use bitplane_sessiond::dev::{self, DETACH};
-use bitplane_sessiond::env::EnvMap;
-use bitplane_sessiond::module::{Availability, BoxFuture, Call, Connection, Module, ModuleContext};
+use bitplane_sessiond::session::Sessions;
 use serde_json::{Value, json};
-use support::TestDaemon;
+use support::{TestDaemon, contains, shell_env};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
-async fn attach_shows_the_snapshot_then_echoes_typed_input() {
-    let daemon = TestDaemon::start(vec![Arc::new(StubSessions::default())]).await;
+async fn attach_shows_a_real_session_and_types_into_it() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start_with_env(vec![Sessions::module()], shell_env(home.path())).await;
     let mut client = daemon.connect_hello().await;
+    let opened = client
+        .call("session.open", Some(json!({ "root": root.path() })))
+        .await
+        .unwrap();
+    let session = opened["session"]["id"].as_str().unwrap().to_string();
     let (mut keyboard, input) = tokio::io::duplex(64);
-    let (output, mut screen) = tokio::io::duplex(4096);
+    let (output, mut screen) = tokio::io::duplex(1 << 20);
+    let (resize, resizes) = tokio::sync::mpsc::unbounded_channel();
 
-    let attach =
-        tokio::spawn(async move { dev::attach(&mut client, "s1", (80, 24), input, output).await });
+    let attach = tokio::spawn(async move {
+        dev::attach(&mut client, &session, (100, 30), resizes, input, output).await
+    });
     let mut shown = Vec::new();
-    read_until(&mut screen, &mut shown, b"$ ").await;
-    keyboard.write_all(b"ls\r").await.unwrap();
-    read_until(&mut screen, &mut shown, b"ls\r").await;
+    keyboard.write_all(b"echo typed-$((6*7))\r").await.unwrap();
+    read_until(&mut screen, &mut shown, b"typed-42").await;
+    resize.send((132, 43)).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    keyboard.write_all(b"stty size\r").await.unwrap();
+    read_until(&mut screen, &mut shown, b"43 132").await;
     keyboard.write_all(&[DETACH]).await.unwrap();
 
     attach.await.unwrap().unwrap();
-    assert_eq!(shown, b"s1 at 80x24\r\n$ ls\r");
 }
 
 #[tokio::test]
 async fn events_prints_one_json_line_per_event() {
-    let daemon = TestDaemon::start(vec![Arc::new(StubSessions::default())]).await;
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let daemon = TestDaemon::start_with_env(vec![Sessions::module()], shell_env(home.path())).await;
     let mut listener = daemon.connect_hello().await;
     let caller = daemon.connect_hello().await;
     let (out, mut lines) = tokio::io::duplex(4096);
     let printer = tokio::spawn(async move { dev::events(&mut listener, out).await });
 
     caller
-        .call("session.rename", Some(json!({ "name": "build" })))
+        .call("session.open", Some(json!({ "root": root.path() })))
         .await
         .unwrap();
 
     let mut shown = Vec::new();
     read_until(&mut lines, &mut shown, b"\n").await;
-    let event: Value = serde_json::from_slice(&shown).unwrap();
+    let line = shown.split(|&byte| byte == b'\n').next().unwrap();
+    let event: Value = serde_json::from_slice(line).unwrap();
     assert_eq!(event["method"], "session.changed");
-    assert_eq!(event["params"]["name"], "build");
+    assert_eq!(
+        event["params"]["session"]["root"],
+        root.path().display().to_string()
+    );
     printer.abort();
 }
 
 async fn read_until(reader: &mut (impl AsyncReadExt + Unpin), seen: &mut Vec<u8>, end: &[u8]) {
-    let mut buf = [0u8; 256];
-    while !seen.ends_with(end) {
-        let read = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut buf))
+    let mut buf = [0u8; 4096];
+    while !contains(seen, end) {
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), reader.read(&mut buf))
             .await
             .expect("output arrives")
             .unwrap();
@@ -63,66 +76,5 @@ async fn read_until(reader: &mut (impl AsyncReadExt + Unpin), seen: &mut Vec<u8>
             String::from_utf8_lossy(end)
         );
         seen.extend_from_slice(&buf[..read]);
-    }
-}
-
-/// Stands in for the sessions module until it exists: one fake terminal per
-/// attachment that echoes what is typed.
-#[derive(Default)]
-struct StubSessions {
-    context: OnceLock<ModuleContext>,
-}
-
-impl Module for StubSessions {
-    fn namespace(&self) -> &'static str {
-        "session"
-    }
-
-    fn probe(&self, _env: &EnvMap) -> Availability {
-        Availability::Available { info: None }
-    }
-
-    fn start(&self, context: ModuleContext) {
-        let _ = self.context.set(context);
-    }
-
-    fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>> {
-        Box::pin(async move {
-            let params = call.params.unwrap_or_default();
-            match call.method.as_str() {
-                "session.attachment.open" => {
-                    let banner = format!(
-                        "{} at {}x{}\r\n$ ",
-                        params["session"].as_str().unwrap(),
-                        params["cols"],
-                        params["rows"]
-                    );
-                    let _ = call.connection.frames.send(Frame::Snapshot {
-                        attachment: 1,
-                        offset: 0,
-                        data: banner.into_bytes(),
-                    });
-                    Ok(json!({ "attachment": 1, "session": params["session"] }))
-                }
-                "session.attachment.close" => Ok(Value::Null),
-                "session.rename" => {
-                    self.context
-                        .get()
-                        .unwrap()
-                        .events
-                        .emit("session.changed", params);
-                    Ok(Value::Null)
-                }
-                _ => Err(RpcError::new(RpcError::METHOD_NOT_FOUND, call.method)),
-            }
-        })
-    }
-
-    fn input(&self, connection: &Connection, attachment: u32, data: Vec<u8>) {
-        let _ = connection.frames.send(Frame::Output {
-            attachment,
-            offset: 0,
-            data,
-        });
     }
 }

@@ -22,3 +22,7 @@ bitplane-protocol = { path = "../bitplane-protocol/crates/bitplane-protocol" }
 ```
 
 The patch rewrites `Cargo.lock`; never commit that version. Push the protocol change, bump `rev`, and let CI's `--locked` build check the lock.
+
+## Building
+
+The daemon links libghostty-vt, built from source with Zig 0.15.2. Run cargo through `scripts/build-env.sh` (`scripts/build-env.sh cargo test`): it vendors ghostty and, on macOS, puts the SDK shim on `PATH`. See `docs/build.md`.
