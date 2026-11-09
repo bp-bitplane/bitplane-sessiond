@@ -25,7 +25,9 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::env::{self, EnvMap};
-use crate::module::{Availability, BoxFuture, Call, Connection, Events, Module, ModuleContext};
+use crate::module::{
+    Availability, BoxFuture, Bus, Call, Connection, Events, Instruments, Module, ModuleContext,
+};
 
 use self::persist::{AgentLink, Persist, Record};
 use self::pty::{PARENT_SESSION_VARS, Pty, Spawn};
@@ -39,6 +41,12 @@ const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
 /// an ancestor renamed or unmounted, which a watch on the root misses.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Published on the bus once a session is closed.
+#[derive(Debug, Clone)]
+pub struct SessionClosed {
+    pub session: SessionId,
+}
+
 #[derive(Default)]
 pub struct Sessions {
     shared: OnceLock<Arc<Shared>>,
@@ -47,6 +55,8 @@ pub struct Sessions {
 struct Shared {
     env: Arc<EnvMap>,
     events: Events,
+    bus: Bus,
+    instruments: Instruments,
     state: Mutex<State>,
     persist: Persist,
 }
@@ -100,13 +110,15 @@ impl Module for Sessions {
         Availability::Available { info: None }
     }
 
-    /// Restores every persisted session before returning, so the first
-    /// `session.list` is complete.
+    /// Registers every persisted session before returning, so the first
+    /// `session.list` is complete; their shells start in `ready`.
     fn start(&self, context: ModuleContext) {
         let restored = persist::restore(&context.dirs, &context.state_dir);
         let shared = Arc::new(Shared {
             env: context.env,
             events: context.events,
+            bus: context.bus,
+            instruments: context.instruments,
             state: Mutex::new(State::default()),
             persist: Persist::new(restored.file),
         });
@@ -122,6 +134,12 @@ impl Module for Sessions {
                 .name("session-persist".into())
                 .spawn(move || save(&saver))
                 .expect("spawning a thread");
+        }
+    }
+
+    fn ready(&self) {
+        if let Some(shared) = self.shared.get() {
+            shared.spawn_restored();
         }
     }
 
@@ -249,19 +267,28 @@ impl Shared {
         Ok(SessionResult { session: info })
     }
 
-    /// Fresh shells for persisted sessions, except where the root is gone.
+    /// Persisted sessions, without shells yet; where the root is gone they
+    /// get none.
     fn restore(self: &Arc<Self>, records: Vec<Record>) {
         let mut state = self.state.lock().unwrap();
         for record in records {
             state.next_seq = state.next_seq.max(record.seq);
             let mut entry = self.entry(record);
-            if Path::new(&entry.info.root).is_dir() {
-                self.spawn_shell(&mut entry);
-            } else {
+            if !Path::new(&entry.info.root).is_dir() {
                 entry.info.root_gone = true;
                 entry.info.status = SessionStatus::Exited { code: -1 };
             }
             state.sessions.insert(entry.info.id.clone(), entry);
+        }
+    }
+
+    /// Fresh shells for the restored sessions whose root is there.
+    fn spawn_restored(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap();
+        for entry in state.sessions.values_mut() {
+            if entry.pty.is_none() && !entry.info.root_gone {
+                self.spawn_shell(entry);
+            }
         }
     }
 
@@ -403,11 +430,13 @@ impl Shared {
         let shell = env::resolve_shell(entry.env.get("SHELL").map(String::as_str));
         let weak = Arc::downgrade(self);
         let id = entry.info.id.clone();
+        let mut shell_env = entry.env.clone();
+        self.instruments.apply(&id, &mut shell_env);
         let spawned = Pty::spawn(
             Spawn {
                 shell: &shell,
                 root: Path::new(&entry.info.root),
-                env: entry.env.clone(),
+                env: shell_env,
                 size,
                 generation,
                 output: entry.stream.clone(),
@@ -437,8 +466,12 @@ impl Shared {
         self.persist.touch();
         self.events.emit(
             method::SESSION_REMOVED,
-            serde_json::to_value(SessionRef { session }).expect("protocol types serialize"),
+            serde_json::to_value(SessionRef {
+                session: session.clone(),
+            })
+            .expect("protocol types serialize"),
         );
+        self.bus.publish(SessionClosed { session });
         Ok(())
     }
 
