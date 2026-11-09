@@ -4,9 +4,10 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bitplane_protocol::{Capability, ErrorCode, Frame, Id, Notification, Response, RpcError};
 use serde_json::Value;
@@ -37,6 +38,15 @@ pub trait Module: Send + Sync + 'static {
 
     /// Called once, after probing, on available modules only.
     fn start(&self, _context: ModuleContext) {}
+
+    /// Called once every available module has started; work that reaches
+    /// other modules, such as spawning instrumented shells, starts here.
+    fn ready(&self) {}
+
+    /// What every shell a session starts gets from this module (ADR 0029).
+    fn instrument(&self, _session: &str) -> Option<Instrumentation> {
+        None
+    }
 
     fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>>;
 
@@ -73,6 +83,13 @@ pub struct Connection {
     pub frames: mpsc::UnboundedSender<Frame>,
 }
 
+/// Env set and `PATH` entries prepended for a session's shell.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Instrumentation {
+    pub env: EnvMap,
+    pub path_prepend: Vec<PathBuf>,
+}
+
 pub struct ModuleContext {
     /// This instance's directories.
     pub dirs: Dirs,
@@ -83,6 +100,7 @@ pub struct ModuleContext {
     pub env: Arc<EnvMap>,
     pub events: Events,
     pub bus: Bus,
+    pub instruments: Instruments,
 }
 
 /// Broadcast events to every connection that completed `hello`.
@@ -92,6 +110,11 @@ pub struct Events(pub(crate) broadcast::Sender<Notification>);
 /// Change notifications between modules; never direct calls.
 #[derive(Clone)]
 pub struct Bus(pub(crate) broadcast::Sender<Arc<dyn Any + Send + Sync>>);
+
+/// Every available module's [`Module::instrument`], set before any `ready`.
+/// Weak, as the modules hold it.
+#[derive(Clone, Default)]
+pub struct Instruments(Arc<OnceLock<Vec<Weak<dyn Module>>>>);
 
 /// The namespace that owns INPUT frames.
 const FRAME_OWNER: &str = "session";
@@ -145,6 +168,32 @@ impl Bus {
     }
 }
 
+impl Instruments {
+    /// Adds what every module instruments a session's shell with to its env,
+    /// in module order.
+    pub fn apply(&self, session: &str, env: &mut EnvMap) {
+        let mut path = Vec::new();
+        for module in self.0.get().into_iter().flatten() {
+            let Some(Instrumentation {
+                env: added,
+                path_prepend,
+            }) = module
+                .upgrade()
+                .and_then(|module| module.instrument(session))
+            else {
+                continue;
+            };
+            env.extend(added);
+            path.extend(path_prepend.iter().map(|dir| dir.display().to_string()));
+        }
+        if path.is_empty() {
+            return;
+        }
+        path.extend(env.get("PATH").filter(|path| !path.is_empty()).cloned());
+        env.insert("PATH".into(), path.join(":"));
+    }
+}
+
 impl Registry {
     pub fn start(
         modules: Vec<Arc<dyn Module>>,
@@ -153,6 +202,7 @@ impl Registry {
         events: Events,
     ) -> std::io::Result<Self> {
         let bus = Bus(broadcast::channel(256).0);
+        let instruments = Instruments::default();
         let mut availability: HashMap<&'static str, Availability> = modules
             .iter()
             .map(|module| (module.namespace(), module.probe(&env)))
@@ -173,12 +223,24 @@ impl Registry {
                     env: env.clone(),
                     events: events.clone(),
                     bus: bus.clone(),
+                    instruments: instruments.clone(),
                 });
             }
             entries.push(Entry {
                 module,
                 availability,
             });
+        }
+        let available: Vec<Arc<dyn Module>> = entries
+            .iter()
+            .filter(|entry| matches!(entry.availability, Availability::Available { .. }))
+            .map(|entry| entry.module.clone())
+            .collect();
+        let _ = instruments
+            .0
+            .set(available.iter().map(Arc::downgrade).collect());
+        for module in available {
+            module.ready();
         }
         Ok(Self {
             entries,
