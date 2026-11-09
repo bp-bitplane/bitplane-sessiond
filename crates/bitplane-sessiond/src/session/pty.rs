@@ -40,6 +40,7 @@ pub struct Pty {
 /// The terminal's foreground process group, as cc's busy check sees it.
 pub struct Foreground {
     pub name: Option<String>,
+    pub group: u32,
     /// The group is not the shell's.
     pub busy: bool,
 }
@@ -106,10 +107,15 @@ impl Pty {
         let leader = self.master.process_group_leader()?;
         Some(Foreground {
             name: process_name(leader),
+            group: leader as u32,
             busy: self
                 .shell_pid
                 .is_some_and(|shell| shell as libc::pid_t != leader),
         })
+    }
+
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
     }
 
     /// Queues one INPUT frame; the writer thread writes it whole.

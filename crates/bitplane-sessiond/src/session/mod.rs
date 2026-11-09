@@ -10,7 +10,7 @@ mod stream;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitplane_protocol::session::{
     AttachmentAckParams, AttachmentError, AttachmentId, AttachmentOpenParams, AttachmentOpenResult,
@@ -47,6 +47,18 @@ pub struct SessionClosed {
     pub session: SessionId,
 }
 
+/// Published on the bus whenever a session's shell or its terminal's
+/// foreground process group changes; both are `None` once the shell is gone.
+#[derive(Debug, Clone)]
+pub struct SessionForeground {
+    pub session: SessionId,
+    pub shell: Option<u32>,
+    pub group: Option<u32>,
+    pub name: Option<String>,
+    /// When the change was seen.
+    pub at: Instant,
+}
+
 #[derive(Default)]
 pub struct Sessions {
     shared: OnceLock<Arc<Shared>>,
@@ -79,6 +91,8 @@ struct Entry {
     stream: mpsc::Sender<Command>,
     /// `None` once the shell exited or failed to start.
     pty: Option<Pty>,
+    /// The shell and foreground group last published as [`SessionForeground`].
+    processes: (Option<u32>, Option<u32>),
     /// Counts the session's shells; a stale one's exit is ignored.
     generation: u64,
 }
@@ -327,6 +341,7 @@ impl Shared {
             agent,
             stream,
             pty: None,
+            processes: (None, None),
             generation: 0,
         }
     }
@@ -641,6 +656,17 @@ impl Shared {
         self.changed(&entry.info);
     }
 
+    fn foreground(&self, id: &str, entry: &mut Entry, shell: Option<u32>, group: Option<u32>) {
+        entry.processes = (shell, group);
+        self.bus.publish(SessionForeground {
+            session: id.to_string(),
+            shell,
+            group,
+            name: entry.info.foreground.clone(),
+            at: Instant::now(),
+        });
+    }
+
     fn changed(&self, session: &Session) {
         self.events.emit(
             method::SESSION_CHANGED,
@@ -668,6 +694,7 @@ fn exited(shared: &Weak<Shared>, id: &str, generation: u64, code: i32) {
     entry.info.foreground = None;
     entry.info.status = SessionStatus::Exited { code };
     shared.changed(&entry.info);
+    shared.foreground(id, entry, None, None);
 }
 
 fn retitled(shared: &Weak<Shared>, id: &str, title: Option<String>) {
@@ -739,15 +766,19 @@ fn watch(shared: &Weak<Shared>) {
             let Some(entry) = state.sessions.get_mut(&id) else {
                 continue;
             };
-            let foreground = entry
+            let shell = entry.pty.as_ref().and_then(Pty::shell_pid);
+            let (foreground, group) = entry
                 .pty
                 .as_ref()
                 .and_then(Pty::foreground)
-                .and_then(|fg| fg.name);
+                .map_or((None, None), |fg| (fg.name, Some(fg.group)));
             if entry.info.root_gone != gone || entry.info.foreground != foreground {
                 entry.info.root_gone = gone;
                 entry.info.foreground = foreground;
                 shared.changed(&entry.info);
+            }
+            if entry.processes != (shell, group) {
+                shared.foreground(&id, entry, shell, group);
             }
         }
     }
