@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bitplane_protocol::{Capability, ErrorCode, Frame, Id, Notification, Response, RpcError};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
@@ -48,6 +49,19 @@ pub trait Module: Send + Sync + 'static {
         None
     }
 
+    /// Takes over resuming `link` in the session's next shell (ADR 0031):
+    /// what to type, and the link as it now stands. `None` from a module
+    /// that runs no agents.
+    fn resume(&self, _session: &str, _link: &AgentLink) -> Option<Result<Resumed, RpcError>> {
+        None
+    }
+
+    /// The session's agent link as this module last decided it; `None` when
+    /// it has not, and the link the session was restored with stands.
+    fn agent_link(&self, _session: &str) -> Option<Option<AgentLink>> {
+        None
+    }
+
     fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>>;
 
     /// An INPUT frame for one of this module's attachments.
@@ -56,9 +70,13 @@ pub trait Module: Send + Sync + 'static {
     /// The connection closed; frames sent to it go nowhere from now on.
     fn disconnected(&self, _connection: u64) {}
 
-    /// The daemon is about to exit; `restore` says whether the next instance
-    /// brings this module's state back (ADR 0027). Called at most once.
+    /// The daemon is about to exit: save what the next instance restores
+    /// (when `restore`, ADR 0027) and stop taking changes. Called at most
+    /// once, on every module before any [`Module::terminate`].
     fn shutdown(&self, _restore: bool) {}
+
+    /// Then end the processes the module owns.
+    fn terminate(&self, _restore: bool) {}
 }
 
 pub struct Call {
@@ -81,6 +99,28 @@ pub struct Reply {
 pub struct Connection {
     pub id: u64,
     pub frames: mpsc::UnboundedSender<Frame>,
+}
+
+/// The agent session a session's shell resumes, and where it started
+/// (ADR 0031); persisted with the session (ADR 0027).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLink {
+    pub agent_session: String,
+    pub cwd: String,
+}
+
+/// What a session's shell is typed to resume its agent session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resumed {
+    pub link: AgentLink,
+    pub command: String,
+}
+
+/// Published on the bus whenever a module changed a session's agent link.
+#[derive(Debug, Clone)]
+pub struct AgentLinkChanged {
+    pub session: String,
 }
 
 /// Env set and `PATH` entries prepended for a session's shell.
@@ -111,8 +151,9 @@ pub struct Events(pub(crate) broadcast::Sender<Notification>);
 #[derive(Clone)]
 pub struct Bus(pub(crate) broadcast::Sender<Arc<dyn Any + Send + Sync>>);
 
-/// Every available module's [`Module::instrument`], set before any `ready`.
-/// Weak, as the modules hold it.
+/// Every available module, for what a session's shells get from them:
+/// [`Module::instrument`], [`Module::resume`] and [`Module::agent_link`].
+/// Set before any `ready`; weak, as the modules hold it.
 #[derive(Clone, Default)]
 pub struct Instruments(Arc<OnceLock<Vec<Weak<dyn Module>>>>);
 
@@ -173,13 +214,11 @@ impl Instruments {
     /// in module order.
     pub fn apply(&self, session: &str, env: &mut EnvMap) {
         let mut path = Vec::new();
-        for module in self.0.get().into_iter().flatten() {
+        for module in self.modules() {
             let Some(Instrumentation {
                 env: added,
                 path_prepend,
-            }) = module
-                .upgrade()
-                .and_then(|module| module.instrument(session))
+            }) = module.instrument(session)
             else {
                 continue;
             };
@@ -191,6 +230,23 @@ impl Instruments {
         }
         path.extend(env.get("PATH").filter(|path| !path.is_empty()).cloned());
         env.insert("PATH".into(), path.join(":"));
+    }
+
+    /// The first module's [`Module::resume`]; `None` when no module runs agents.
+    pub fn resume(&self, session: &str, link: &AgentLink) -> Option<Result<Resumed, RpcError>> {
+        self.modules()
+            .find_map(|module| module.resume(session, link))
+    }
+
+    /// The session's agent link: the first module's decision, else `restored`.
+    pub fn agent_link(&self, session: &str, restored: Option<&AgentLink>) -> Option<AgentLink> {
+        self.modules()
+            .find_map(|module| module.agent_link(session))
+            .unwrap_or_else(|| restored.cloned())
+    }
+
+    fn modules(&self) -> impl Iterator<Item = Arc<dyn Module>> + '_ {
+        self.0.get().into_iter().flatten().filter_map(Weak::upgrade)
     }
 }
 
@@ -308,15 +364,24 @@ impl Registry {
         }
     }
 
-    /// Every available module's [`Module::shutdown`], once; later calls do nothing.
+    /// Every available module's [`Module::shutdown`], then every one's
+    /// [`Module::terminate`], once; later calls do nothing. Sessions persist
+    /// the agent links before the agent module stops taking hooks, and only
+    /// then are the shells hung up (ADR 0031).
     pub fn shutdown(&self, restore: bool) {
         if self.shut_down.swap(true, Ordering::SeqCst) {
             return;
         }
-        for entry in &self.entries {
-            if let Availability::Available { .. } = entry.availability {
-                entry.module.shutdown(restore);
-            }
+        let available = || {
+            self.entries
+                .iter()
+                .filter(|entry| matches!(entry.availability, Availability::Available { .. }))
+        };
+        for entry in available() {
+            entry.module.shutdown(restore);
+        }
+        for entry in available() {
+            entry.module.terminate(restore);
         }
     }
 

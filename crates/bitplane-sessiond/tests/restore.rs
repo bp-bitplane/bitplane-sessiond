@@ -1,23 +1,11 @@
 mod support;
 
-use std::path::PathBuf;
-use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use bitplane_sessiond::client::Client;
-use bitplane_sessiond::paths::Dirs;
 use bitplane_sessiond::pidfile::Pidfile;
 use serde_json::{Value, json};
-use support::{Screen, open, short_tempdir};
-
-const EXE: &str = env!("CARGO_BIN_EXE_bitplane-sessiond");
-
-#[derive(Clone, Copy, Debug)]
-enum Stop {
-    ShutdownWithRestore,
-    Sigterm,
-    Sigkill,
-}
+use support::{Host, Screen, Stop, open, write_sessions};
 
 #[tokio::test]
 async fn shutdown_with_restore_brings_every_session_back() {
@@ -327,152 +315,5 @@ async fn wait_for_status(client: &Client, index: usize, status: Value) {
         }
         assert!(Instant::now() < deadline, "no {status} in {listed}");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-fn write_sessions(dirs: &Dirs, file: Value) -> PathBuf {
-    let dir = dirs.state.join("session");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("sessions.json");
-    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
-    path
-}
-
-/// A host's directories in a temp dir, keyed by protocol version like the
-/// real ones, so other versions' dirs sit next to them.
-struct Host {
-    dirs: Dirs,
-    base: PathBuf,
-    home: tempfile::TempDir,
-    _root: tempfile::TempDir,
-}
-
-impl Host {
-    fn new() -> Self {
-        let (root, base) = short_tempdir();
-        Self {
-            dirs: Dirs::for_version(&base.join("run"), &base.join("state")),
-            base,
-            home: tempfile::tempdir().unwrap(),
-            _root: root,
-        }
-    }
-
-    fn serve(&self) -> Daemon {
-        let log = self.base.join("daemon.log");
-        let stderr = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .unwrap();
-        let child = std::process::Command::new(EXE)
-            .arg("serve")
-            .arg("--runtime-dir")
-            .arg(&self.dirs.runtime)
-            .arg("--state-dir")
-            .arg(&self.dirs.state)
-            .env_clear()
-            .env("SHELL", "/bin/sh")
-            .env("HOME", self.home.path())
-            .env("PATH", "/usr/bin:/bin")
-            .env("PS1", "$ ")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(stderr)
-            .spawn()
-            .unwrap();
-        Daemon {
-            child,
-            socket: self.dirs.socket(),
-            log,
-        }
-    }
-
-    fn sessions_file(&self) -> PathBuf {
-        self.dirs.state.join("session").join("sessions.json")
-    }
-
-    /// Where another protocol version's daemon keeps its socket and state.
-    fn other_version(&self, version: &str) -> Dirs {
-        let versions = |base: &str| self.base.join(base).join("bitplane").join("sessiond");
-        Dirs {
-            runtime: versions("run").join(version),
-            state: versions("state").join(version),
-        }
-    }
-}
-
-/// The daemon this test spawned; only this child is ever signalled.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-    log: PathBuf,
-}
-
-impl Daemon {
-    /// Retries until the daemon accepts, past a socket a killed one left.
-    async fn connect(&mut self) -> Client {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(client) = Client::connect(&self.socket).await {
-                return client;
-            }
-            let exited = self.child.try_wait().unwrap();
-            if exited.is_some() || Instant::now() >= deadline {
-                let log = std::fs::read_to_string(&self.log).unwrap_or_default();
-                panic!("no daemon on {:?} ({exited:?}):\n{log}", self.socket);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn stop(&mut self, client: &Client, stop: Stop) {
-        match stop {
-            Stop::ShutdownWithRestore => {
-                let reply = client
-                    .call("daemon.shutdown", Some(json!({ "restore": true })))
-                    .await
-                    .unwrap();
-                assert_eq!(reply, json!({}));
-            }
-            Stop::Sigterm => self.signal(rustix::process::Signal::TERM),
-            Stop::Sigkill => {
-                // Past the 500 ms debounce: a crash loses at most that.
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                self.signal(rustix::process::Signal::KILL);
-            }
-        }
-        self.wait().await;
-    }
-
-    async fn shutdown(&mut self, client: &Client, restore: bool) {
-        let reply = client
-            .call("daemon.shutdown", Some(json!({ "restore": restore })))
-            .await
-            .unwrap();
-        assert_eq!(reply, json!({}));
-        self.wait().await;
-    }
-
-    fn signal(&self, signal: rustix::process::Signal) {
-        let pid = rustix::process::Pid::from_child(&self.child);
-        rustix::process::kill_process(pid, signal).unwrap();
-    }
-
-    async fn wait(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while self.child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "the daemon did not exit");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
     }
 }

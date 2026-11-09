@@ -48,7 +48,8 @@ pub struct Foreground {
 /// What a shell is started with, besides its environment.
 pub struct Spawn<'a> {
     pub shell: &'a Path,
-    pub root: &'a Path,
+    /// The session root, or where its agent link resumes.
+    pub cwd: &'a Path,
     pub env: EnvMap,
     pub size: Size,
     /// Tags this PTY's output, so a restarted session's stream drops the old one's.
@@ -68,7 +69,7 @@ impl Pty {
             .map_err(|e| format!("couldn't open a terminal: {e}"))?;
         let mut command = CommandBuilder::new(spawn.shell);
         command.arg("-l");
-        command.cwd(spawn.root);
+        command.cwd(spawn.cwd);
         command.env_clear();
         for (key, value) in &spawn.env {
             command.env(key, value);

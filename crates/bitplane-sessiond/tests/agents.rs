@@ -14,7 +14,7 @@ use bitplane_sessiond::client::{Client, ClientError};
 use bitplane_sessiond::env::EnvMap;
 use bitplane_sessiond::session::Sessions;
 use serde_json::{Value, json};
-use support::{Screen, TestDaemon, next_event, open, shell_env};
+use support::{Host, Screen, Stop, TestDaemon, next_event, open, shell_env};
 
 const DAEMON_EXE: &str = env!("CARGO_BIN_EXE_bitplane-sessiond");
 const POLL: Duration = Duration::from_millis(100);
@@ -30,6 +30,11 @@ const GRACE: Duration = Duration::from_millis(500);
 /// which is when the id becomes known), and changed without any hook by the
 /// `reg`, `regname`, `regsid` and `bg` lines. `agents --json` calls are
 /// counted in `$FAKE_CLAUDE_LOG/agents`.
+///
+/// `--resume <id>` starts that agent session half a second in, as the real
+/// one takes a while; while `$FAKE_CLAUDE_LOG/resume-fails` exists it
+/// instead waits that many seconds and quits without a `SessionStart`.
+/// `sessionend` runs the `SessionEnd` hook without quitting, as a hang-up does.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 log="$FAKE_CLAUDE_LOG"
 if [ "$1" = agents ] && [ "$2" = --json ]; then
@@ -46,9 +51,11 @@ fi
 echo "$*" >> "$log/calls"
 settings=""
 print=""
+resume=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --settings) settings="$2"; shift ;;
+    --resume) resume="$2"; shift ;;
     -p) print=1 ;;
   esac
   shift
@@ -86,8 +93,19 @@ if [ -n "$print" ]; then
   exit 0
 fi
 export CLAUDECODE=1
+if [ -n "$resume" ] && [ -f "$log/resume-fails" ]; then
+  sleep "$(cat "$log/resume-fails")"
+  echo "No conversation found with session ID: $resume"
+  exit 1
+fi
 trap 'rm -f "$entry"' EXIT
 reg
+if [ -n "$resume" ]; then
+  sleep 0.5
+  sid="$resume"
+  emit SessionStart ',"source":"resume"'
+  reg
+fi
 echo "fake-claude ready-$FAKE_RUN"
 while IFS= read -r line; do
   n="${line##*#}"
@@ -105,6 +123,7 @@ while IFS= read -r line; do
     stop) set_status idle; emit Stop ',"stop_hook_active":false' ;;
     fail) set_status idle; emit StopFailure ',"error":"rate_limit","error_details":"429 Too Many Requests","last_assistant_message":"API Error: Rate limit reached"' ;;
     end) rm -f "$entry"; emit SessionEnd ",\"reason\":\"$2\""; exit 0 ;;
+    sessionend) emit SessionEnd ",\"reason\":\"$2\"" ;;
     reg) s="$2"; shift 2; set_status "$s" "$*" ;;
     regname) name="$2"; reg ;;
     regsid) sid="$2"; reg ;;
@@ -567,6 +586,12 @@ async fn an_agent_moved_to_bg_exits() {
         (&agent["agentSession"], &agent["state"]),
         (&json!("a1"), &json!({ "kind": "exited" }))
     );
+    let fixture = fixture.restart().await;
+    assert_eq!(
+        fixture.list().await,
+        Vec::<Value>::new(),
+        "/bg drops the link"
+    );
 }
 
 #[tokio::test]
@@ -598,6 +623,219 @@ async fn without_claude_on_path_the_module_is_unavailable() {
     assert_eq!(error.protocol_code(), Some(ErrorCode::ModuleUnavailable));
 }
 
+#[tokio::test]
+async fn opening_a_session_that_resumes_types_the_resume_line_and_refuses_a_live_one() {
+    let mut fixture = Fixture::start().await;
+    let root = fixture.root.path().to_path_buf();
+
+    let session = open(&fixture.client, json!({ "root": root, "resume": "a1" })).await;
+
+    let id = session["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        fixture.changed().await,
+        json!({
+            "agentSession": "a1",
+            "session": id,
+            "cwd": root,
+            "state": { "kind": "resuming" },
+            "tracking": "hooks",
+        })
+    );
+    let agent = fixture.changed().await;
+    assert_eq!(
+        (&agent["agentSession"], &agent["state"]),
+        (&json!("a1"), &json!({ "kind": "idle" }))
+    );
+    assert_eq!(agent["cwd"], json!(root.canonicalize().unwrap()));
+    let resumed = fixture.calls();
+    assert!(resumed.contains("--resume a1"), "{resumed}");
+    assert!(
+        resumed.contains("--settings"),
+        "through the wrapper: {resumed}"
+    );
+
+    for (resume, code) in [
+        ("a1", Some(ErrorCode::AgentLive)),
+        ("a1; touch pwned", None),
+    ] {
+        let Err(ClientError::Rpc(error)) = fixture
+            .client
+            .call(
+                "session.open",
+                Some(json!({ "root": root, "resume": resume })),
+            )
+            .await
+        else {
+            panic!("resuming {resume:?} must fail")
+        };
+        assert_eq!(error.protocol_code(), code, "{resume}");
+    }
+    let listed = fixture.client.call("session.list", None).await.unwrap();
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_resumed_agent_that_never_starts_exits() {
+    let mut fixture = Fixture::start().await;
+    let root = fixture.root.path().to_path_buf();
+
+    for (id, fails_after) in [("a1", "1"), ("a2", "0")] {
+        std::fs::write(fixture.log.join("resume-fails"), fails_after).unwrap();
+        open(&fixture.client, json!({ "root": root, "resume": id })).await;
+
+        assert_eq!(fixture.changed().await["state"]["kind"], "resuming");
+        let agent = fixture.changed_within(Duration::from_secs(10)).await;
+        assert_eq!(
+            (&agent["agentSession"], &agent["state"]),
+            (&json!(id), &json!({ "kind": "exited" })),
+            "failing after {fails_after}s"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_resumes_the_agent_session_each_session_last_started() {
+    let mut fixture = Fixture::start().await;
+    let (first, mut screen) = fixture.session().await;
+    fixture.claude(&mut screen, "claude").await;
+    for line in ["start a1 startup", "start a1 compact", "start a2 clear"] {
+        fixture.say(&mut screen, line).await;
+    }
+    fixture.say(&mut screen, "sessionend other").await;
+    let (second, mut screen) = fixture.session().await;
+    fixture.claude(&mut screen, "claude").await;
+    fixture.say(&mut screen, "start b1 startup").await;
+
+    let mut fixture = fixture.restart().await;
+
+    let mut listed = fixture.list().await;
+    listed.sort_by_key(|agent| agent["agentSession"].as_str().unwrap().to_string());
+    let summary: Vec<Value> = listed
+        .iter()
+        .map(|agent| json!([agent["agentSession"], agent["session"], agent["state"]]))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            json!(["a2", first, { "kind": "resuming" }]),
+            json!(["b1", second, { "kind": "resuming" }]),
+        ]
+    );
+    for _ in 0..2 {
+        assert_eq!(fixture.changed().await["state"], json!({ "kind": "idle" }));
+    }
+    let calls = fixture.calls();
+    assert!(!calls.contains("--resume a1"), "{calls}");
+}
+
+#[tokio::test]
+async fn quitting_claude_clears_the_link() {
+    let mut fixture = Fixture::start().await;
+    let (id, mut screen) = fixture.session().await;
+    fixture.claude(&mut screen, "claude").await;
+    fixture.say(&mut screen, "start a1 startup").await;
+
+    fixture.say(&mut screen, "end prompt_input_exit").await;
+    fixture.shell_in_front(&id).await;
+
+    let fixture = fixture.restart().await;
+    assert_eq!(fixture.list().await, Vec::<Value>::new());
+    assert!(!fixture.calls().contains("--resume"), "{}", fixture.calls());
+}
+
+#[tokio::test]
+async fn without_claude_at_restore_the_shell_comes_back_and_the_link_is_kept() {
+    let mut fixture = Fixture::start().await;
+    let (id, mut screen) = fixture.session().await;
+    fixture.claude(&mut screen, "claude").await;
+    fixture.say(&mut screen, "start a1 startup").await;
+    let mut without = fixture.env.clone();
+    without.insert("PATH".into(), "/usr/bin:/bin".into());
+
+    let mut fixture = fixture.restart_with(without).await;
+
+    let listed = fixture.client.call("session.list", None).await.unwrap();
+    assert_eq!(listed["sessions"][0]["id"], json!(id));
+    assert_eq!(
+        listed["sessions"][0]["status"],
+        json!({ "state": "running" })
+    );
+    let mut screen = Screen::attach(&mut fixture.client, &id).await;
+    screen.type_text(&fixture.client, "echo back-$((6*7))\r");
+    screen.wait_for(&mut fixture.client, "back-42").await;
+    assert!(!screen.text().contains("--resume"), "{}", screen.text());
+    assert!(!fixture.calls().contains("--resume"));
+
+    let mut fixture = fixture.restart().await;
+    let agent = fixture.changed().await;
+    assert_eq!(
+        (&agent["agentSession"], &agent["session"]),
+        (&json!("a1"), &json!(id))
+    );
+}
+
+#[tokio::test]
+async fn shutdown_with_claude_running_keeps_the_link() {
+    the_link_survives(Stop::ShutdownWithRestore).await;
+}
+
+#[tokio::test]
+async fn a_sigterm_with_claude_running_keeps_the_link() {
+    the_link_survives(Stop::Sigterm).await;
+}
+
+#[tokio::test]
+async fn a_sigkill_with_claude_running_keeps_the_link() {
+    the_link_survives(Stop::Sigkill).await;
+}
+
+/// The regression behind cc#43: every way the daemon stops, with the agent
+/// still running in its shell, resumes it in the next instance.
+async fn the_link_survives(stop: Stop) {
+    let host = Host::new();
+    let env = fake_claude_env(host.home.path());
+    let log = host.home.path().join("log");
+    let root = tempfile::tempdir().unwrap();
+    let mut first = host.serve_with(&env);
+    let mut client = first.connect().await;
+    client.hello("test").await.unwrap();
+    let session = open(&client, json!({ "root": root.path() })).await;
+    let id = session["id"].as_str().unwrap().to_string();
+    let mut screen = Screen::attach(&mut client, &id).await;
+    screen.type_text(&client, "claude\r");
+    screen.wait_for(&mut client, "fake-claude ready-").await;
+    screen.type_text(&client, "start a1 startup #1\r");
+    screen.wait_for(&mut client, "done-1").await;
+    let agent = next_event(&mut client, "agent.claude.changed").await["agent"].clone();
+    assert_eq!(agent["agentSession"], "a1");
+
+    first.stop(&client, stop).await;
+    drop(client);
+
+    let mut second = host.serve_with(&env);
+    let client = second.connect().await;
+    client.hello("test").await.unwrap();
+    let listed = client.call("agent.claude.list", None).await.unwrap()["agents"].clone();
+    assert_eq!(
+        (&listed[0]["agentSession"], &listed[0]["session"]),
+        (&json!("a1"), &json!(id)),
+        "after {stop:?}: {listed}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.call("agent.claude.list", None).await.unwrap()["agents"][0]["state"]
+        != json!({ "kind": "idle" })
+    {
+        assert!(
+            Instant::now() < deadline,
+            "a1 never came back after {stop:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let calls = std::fs::read_to_string(log.join("calls")).unwrap();
+    assert!(calls.contains("--resume a1"), "{calls}");
+    second.stop(&client, Stop::Sigterm).await;
+}
+
 /// A daemon with the session and agent modules, whose sessions run a
 /// non-login `/bin/sh` with the fake `claude` on `PATH`: a login shell would
 /// let macOS's `path_helper` put the host's real `claude` first.
@@ -605,6 +843,7 @@ struct Fixture {
     home: tempfile::TempDir,
     root: tempfile::TempDir,
     log: PathBuf,
+    env: EnvMap,
     daemon: TestDaemon,
     client: Client,
     watcher: Client,
@@ -614,28 +853,81 @@ struct Fixture {
 impl Fixture {
     async fn start() -> Self {
         let home = tempfile::tempdir().unwrap();
-        let bin = home.path().join("bin");
-        let log = home.path().join("log");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&log).unwrap();
-        executable(&bin.join("claude"), FAKE_CLAUDE);
-        executable(&bin.join("sh-nologin"), "#!/bin/sh\nexec /bin/sh\n");
-        let mut env: EnvMap = shell_env(home.path());
-        env.insert("SHELL".into(), bin.join("sh-nologin").display().to_string());
-        env.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
-        env.insert("FAKE_CLAUDE_LOG".into(), log.display().to_string());
-        let daemon = TestDaemon::start_with_env(modules(), env).await;
+        let env = fake_claude_env(home.path());
+        let daemon = TestDaemon::start_with_env(modules(), env.clone()).await;
         let watcher = daemon.connect_hello().await;
         let client = daemon.connect_hello().await;
         Self {
+            log: home.path().join("log"),
             home,
             root: tempfile::tempdir().unwrap(),
-            log,
+            env,
             daemon,
             client,
             watcher,
             said: 0,
         }
+    }
+
+    /// `daemon.shutdown { restore: true }`, then the next instance on the
+    /// same directories with `env`.
+    async fn restart_with(self, env: EnvMap) -> Self {
+        let reply = self
+            .client
+            .call("daemon.shutdown", Some(json!({ "restore": true })))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({}));
+        let Self {
+            home,
+            root,
+            log,
+            env: fixture_env,
+            daemon,
+            ..
+        } = self;
+        let daemon = daemon.restart(modules(), env).await;
+        let watcher = daemon.connect_hello().await;
+        let client = daemon.connect_hello().await;
+        Self {
+            home,
+            root,
+            log,
+            env: fixture_env,
+            daemon,
+            client,
+            watcher,
+            said: 0,
+        }
+    }
+
+    async fn restart(self) -> Self {
+        let env = self.env.clone();
+        self.restart_with(env).await
+    }
+
+    /// Waits until the session's shell is back in the terminal's foreground
+    /// and the daemon has seen it there.
+    async fn shell_in_front(&self, session: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let busy = self
+                .client
+                .call("session.busy", Some(json!({ "session": session })))
+                .await
+                .unwrap();
+            if busy["busy"] == false {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the shell never came back");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+
+    /// The `claude` calls the fake was started with.
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.log.join("calls")).unwrap_or_default()
     }
 
     async fn session(&mut self) -> (String, Screen) {
@@ -710,6 +1002,27 @@ fn modules() -> Vec<std::sync::Arc<dyn bitplane_sessiond::module::Module>> {
             },
         ),
     ]
+}
+
+/// A login env whose `claude` is the fake, in `home/bin`, logging to
+/// `home/log`. Its shell is never a login shell: macOS's `path_helper` would
+/// put the host's real `claude` first. It still runs the `-l -i -c` script
+/// a daemon captures its environment with.
+fn fake_claude_env(home: &Path) -> EnvMap {
+    let bin = home.join("bin");
+    let log = home.join("log");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&log).unwrap();
+    executable(&bin.join("claude"), FAKE_CLAUDE);
+    executable(
+        &bin.join("sh-nologin"),
+        "#!/bin/sh\nif [ \"$1 $3\" = \"-l -c\" ]; then eval \"$4\"; exit; fi\nexec /bin/sh\n",
+    );
+    let mut env: EnvMap = shell_env(home);
+    env.insert("SHELL".into(), bin.join("sh-nologin").display().to_string());
+    env.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
+    env.insert("FAKE_CLAUDE_LOG".into(), log.display().to_string());
+    env
 }
 
 fn executable(path: &Path, script: &str) {
