@@ -96,6 +96,7 @@ impl Shared {
         let state = &mut *state;
         let none = Vec::new();
         let mut restarted = Vec::new();
+        let mut backgrounded = Vec::new();
         for tracked in state.agents.iter_mut() {
             let Some(session) = tracked.agent.session.clone() else {
                 continue;
@@ -115,6 +116,7 @@ impl Shared {
                 .any(|entry| entry.background && entry.agent_session.as_ref() == Some(&id))
             {
                 self.change(tracked, |agent| agent.state = AgentState::Exited);
+                backgrounded.push((session, id));
                 continue;
             }
             let entry = entries
@@ -159,6 +161,13 @@ impl Shared {
         }
         for (session, entry) in restarted {
             self.adopt(state, session, &entry);
+        }
+        // `/bg` took the agent out of the terminal; it is not resumed there (ADR 0031).
+        for (session, id) in backgrounded {
+            let linked = state.links.get(&session).cloned().flatten();
+            if linked.is_some_and(|link| link.agent_session == id) {
+                self.link(state, &session, None);
+            }
         }
         self.check_candidates(state, live, joined, snapshot);
     }

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::{AgentAdapter, AgentEvent, Ingested, LiveAgent};
 use crate::env::EnvMap;
-use crate::module::{Availability, Instrumentation};
+use crate::module::{AgentLink, Availability, Instrumentation};
 
 /// The generated settings file the wrapper passes to `claude`.
 pub const SETTINGS_VAR: &str = "BITPLANE_CLAUDE_SETTINGS";
@@ -142,8 +142,8 @@ impl AgentAdapter for Claude {
         parse_registry(&output(command, PROBE_TIMEOUT)?)
     }
 
-    fn resume_command(&self, agent_session: &str) -> String {
-        format!("claude --resume {agent_session}\r")
+    fn resume_command(&self, link: &AgentLink) -> String {
+        format!("claude --resume {}\r", link.agent_session)
     }
 }
 

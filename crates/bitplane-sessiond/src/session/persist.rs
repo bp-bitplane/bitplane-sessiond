@@ -10,6 +10,7 @@ use bitplane_protocol::session::{SessionId, Size};
 use serde::{Deserialize, Serialize};
 
 use crate::env::EnvMap;
+use crate::module::AgentLink;
 use crate::paths::Dirs;
 use crate::pidfile;
 
@@ -35,14 +36,6 @@ pub struct Record {
     pub size: Size,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentLink>,
-}
-
-/// The agent session a restore resumes; kept as-is until the agent adapter owns it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentLink {
-    pub agent_session: String,
-    pub cwd: String,
 }
 
 /// What a daemon starts with: its own sessions, then other versions' after

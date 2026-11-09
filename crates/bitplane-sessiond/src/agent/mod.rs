@@ -15,17 +15,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use bitplane_protocol::RpcError;
 use bitplane_protocol::agent::{
     Agent, AgentError, AgentListResult, AgentRef, AgentResult, AgentSessionId, AgentState,
     Tracking, WaitingReason,
 };
 use bitplane_protocol::session::SessionId;
+use bitplane_protocol::{ErrorCode, RpcError};
 use serde_json::{Value, json};
 
 use crate::env::EnvMap;
 use crate::module::{
-    Availability, BoxFuture, Bus, Call, Events, Instrumentation, Module, ModuleContext,
+    AgentLink, AgentLinkChanged, Availability, BoxFuture, Bus, Call, Events, Instrumentation,
+    Module, ModuleContext, Resumed,
 };
 use crate::session::{SessionClosed, SessionForeground};
 
@@ -36,6 +37,9 @@ pub const SESSION_VAR: &str = "BITPLANE_SESSION_ID";
 /// How many graces past its due a candidate the registry has not listed is
 /// still asked about: an agent registers some time after it starts.
 const CANDIDATE_GRACES: u32 = 4;
+/// How many graces a resumed agent whose shell never ran anything stays
+/// `resuming`: the resume line failed before the agent could start.
+const RESUME_GRACES: u32 = 5;
 
 /// One agent kind's side of the module: how its sessions are wired up and
 /// what its hook payloads mean.
@@ -61,8 +65,8 @@ pub trait AgentAdapter: Send + Sync + 'static {
     /// `None` when the registry could not be read. `env` is the login env.
     fn probe(&self, env: &EnvMap) -> Option<Vec<LiveAgent>>;
 
-    /// What a shell is typed to resume an agent session.
-    fn resume_command(&self, agent_session: &str) -> String;
+    /// What a shell started in `link.cwd` is typed to resume `link`.
+    fn resume_command(&self, link: &AgentLink) -> String;
 }
 
 /// A hook payload, read: the agent session it is about and what happened.
@@ -123,6 +127,7 @@ pub struct Agents {
 struct Shared {
     adapter: Arc<dyn AgentAdapter>,
     events: Events,
+    bus: Bus,
     env: Arc<EnvMap>,
     timing: Timing,
     dir: PathBuf,
@@ -141,6 +146,8 @@ struct State {
     tokens: HashMap<SessionId, String>,
     /// The agent session each session last started.
     current: HashMap<SessionId, AgentSessionId>,
+    /// Each session's agent link, once this module decided it (ADR 0031).
+    links: HashMap<SessionId, Option<AgentLink>>,
     /// In start order.
     agents: Vec<Tracked>,
     /// Each session's shell and terminal foreground, as last published.
@@ -157,6 +164,8 @@ struct Tracked {
     /// Learnt from the registry.
     pid: Option<u32>,
     since: Instant,
+    /// The terminal's foreground left the shell since: a resumed agent ran.
+    ran: bool,
 }
 
 /// A foreground that may be an agent whose hooks did not load: the registry
@@ -223,6 +232,7 @@ impl Module for Agents {
         let shared = Arc::new(Shared {
             adapter: self.adapter.clone(),
             events: context.events,
+            bus: context.bus.clone(),
             env: context.env,
             timing: self.timing,
             dir: context.state_dir,
@@ -272,6 +282,15 @@ impl Module for Agents {
         Some(instrumentation)
     }
 
+    fn resume(&self, session: &str, link: &AgentLink) -> Option<Result<Resumed, RpcError>> {
+        Some(self.shared.get()?.resume(session, link))
+    }
+
+    fn agent_link(&self, session: &str) -> Option<Option<AgentLink>> {
+        let shared = self.shared.get()?;
+        shared.state.lock().unwrap().links.get(session).cloned()
+    }
+
     fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>> {
         Box::pin(async move {
             let shared = self.shared();
@@ -307,6 +326,105 @@ impl Module for Agents {
 }
 
 impl Shared {
+    /// Tracks `link`'s agent session as `resuming` in `session` (ADR 0030)
+    /// and makes it the session's link. An agent session running or
+    /// resuming in another session is refused.
+    fn resume(self: &Arc<Self>, session: &str, link: &AgentLink) -> Result<Resumed, RpcError> {
+        let id = &link.agent_session;
+        // Typed into a shell, so only what an agent session id is made of.
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(RpcError::new(
+                RpcError::INVALID_PARAMS,
+                format!("{id:?} is not an agent session id"),
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        let known = state
+            .agents
+            .iter()
+            .find(|tracked| tracked.agent.agent_session == *id);
+        if let Some(other) = known
+            .filter(|tracked| tracked.agent.state != AgentState::Exited)
+            .and_then(|tracked| tracked.agent.session.clone())
+            .filter(|other| other != session)
+        {
+            return Err(RpcError::protocol(
+                ErrorCode::AgentLive,
+                format!("agent session {id} is live in session {other}"),
+                Some(json!({ "session": other })),
+            ));
+        }
+        let link = AgentLink {
+            agent_session: id.clone(),
+            cwd: known.map_or_else(|| link.cwd.clone(), |tracked| tracked.agent.cwd.clone()),
+        };
+        let agent = Agent {
+            agent_session: id.clone(),
+            session: Some(session.to_string()),
+            cwd: link.cwd.clone(),
+            name: None,
+            state: AgentState::Resuming,
+            last_error: None,
+            tracking: Tracking::Hooks,
+        };
+        self.start_agent(&mut state, agent, None);
+        let since = state
+            .agents
+            .iter_mut()
+            .find(|tracked| tracked.agent.agent_session == *id)
+            .map(|tracked| {
+                tracked.pid = None;
+                tracked.since
+            })
+            .expect("started above");
+        self.link(&mut state, session, Some(link.clone()));
+        drop(state);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let shared = Arc::downgrade(self);
+            let (session, id) = (session.to_string(), id.clone());
+            let wait = self.timing.grace * RESUME_GRACES;
+            runtime.spawn(async move {
+                tokio::time::sleep(wait).await;
+                if let Some(shared) = shared.upgrade() {
+                    shared.never_ran(&session, &id, since);
+                }
+            });
+        }
+        Ok(Resumed {
+            command: self.adapter.resume_command(&link),
+            link,
+        })
+    }
+
+    /// A resumed agent whose shell never left the foreground has exited.
+    fn never_ran(&self, session: &str, agent_session: &str, since: Instant) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(tracked) = state.agents.iter_mut().find(|tracked| {
+            tracked.agent.agent_session == agent_session
+                && tracked.agent.session.as_deref() == Some(session)
+                && tracked.since == since
+                && tracked.agent.state == AgentState::Resuming
+                && !tracked.ran
+        }) {
+            self.change(tracked, |agent| agent.state = AgentState::Exited);
+        }
+    }
+
+    /// Sets the session's agent link and has the sessions saved.
+    fn link(&self, state: &mut State, session: &str, link: Option<AgentLink>) {
+        if state.links.get(session) == Some(&link) {
+            return;
+        }
+        state.links.insert(session.to_string(), link);
+        self.bus.publish(AgentLinkChanged {
+            session: session.to_string(),
+        });
+    }
+
     /// A hook that presents its session's token; any other is dropped.
     fn hook(&self, message: hook::Message) {
         if self.stopped.load(Ordering::SeqCst) {
@@ -327,7 +445,11 @@ impl Shared {
         };
         let session = message.session.as_str();
         match event {
-            AgentEvent::Started { cwd, .. } => {
+            AgentEvent::Started { cwd, source } => {
+                let link = AgentLink {
+                    agent_session: agent_session.clone(),
+                    cwd: cwd.clone(),
+                };
                 let agent = Agent {
                     agent_session,
                     session: Some(session.to_string()),
@@ -338,6 +460,9 @@ impl Shared {
                     tracking: Tracking::Hooks,
                 };
                 self.start_agent(&mut state, agent, None);
+                if source != "compact" {
+                    self.link(&mut state, session, Some(link));
+                }
             }
             AgentEvent::Busy => self.update(&mut state, session, &agent_session, |agent| {
                 agent.state = AgentState::Busy;
@@ -390,6 +515,7 @@ impl Shared {
         let tracked = Tracked {
             pid: pid.or(existing.as_ref().and_then(|tracked| tracked.pid)),
             since: Instant::now(),
+            ran: false,
             agent: {
                 if let Some(existing) = &existing {
                     agent.name = agent.name.or(existing.agent.name.clone());
@@ -434,12 +560,14 @@ impl Shared {
         }
     }
 
-    /// The session's shell or foreground changed. The shell back in front,
-    /// or gone, ends every agent that started before (ADR 0030); anything
-    /// else in front with no live agent may be an agent without hooks.
+    /// A look at the session's shell and foreground. The shell in front,
+    /// or gone, ends every agent that started before (ADR 0030), except a
+    /// resumed one that has not run yet; the shell back in front also clears
+    /// the link to an agent it ended (ADR 0031). Anything else in front
+    /// with no live agent may be an agent without hooks.
     fn foreground(&self, message: &SessionForeground) {
         let mut state = self.state.lock().unwrap();
-        state.processes.insert(
+        let previous = state.processes.insert(
             message.session.clone(),
             Processes {
                 shell: message.shell,
@@ -447,15 +575,36 @@ impl Shared {
                 name: message.name.clone(),
             },
         );
+        let in_session = |tracked: &Tracked| {
+            tracked.agent.session.as_ref() == Some(&message.session) && tracked.since < message.at
+        };
         if message.group.is_none() || message.group == message.shell {
             state.candidates.remove(&message.session);
+            let back = message.group.is_some();
+            let mut ended = Vec::new();
             for tracked in state.agents.iter_mut().filter(|tracked| {
-                tracked.agent.session.as_ref() == Some(&message.session)
-                    && tracked.since < message.at
+                in_session(tracked)
+                    && !(back && tracked.agent.state == AgentState::Resuming && !tracked.ran)
             }) {
                 self.change(tracked, |agent| agent.state = AgentState::Exited);
+                ended.push(tracked.agent.agent_session.clone());
             }
-        } else if !has_live_agent(&state, &message.session) {
+            let linked = state.links.get(&message.session).cloned().flatten();
+            if back && linked.is_some_and(|link| ended.contains(&link.agent_session)) {
+                self.link(&mut state, &message.session, None);
+            }
+            self.wake.notify_one();
+            return;
+        }
+        for tracked in state
+            .agents
+            .iter_mut()
+            .filter(|tracked| in_session(tracked))
+        {
+            tracked.ran = true;
+        }
+        let moved = previous.is_none_or(|previous| previous.group != message.group);
+        if moved && !has_live_agent(&state, &message.session) {
             let due = message.at + self.timing.grace;
             let candidate = Candidate {
                 due,
@@ -471,6 +620,7 @@ impl Shared {
         let mut state = self.state.lock().unwrap();
         state.tokens.remove(session);
         state.current.remove(session);
+        state.links.remove(session);
         state.processes.remove(session);
         state.candidates.remove(session);
         state.hooked.remove(session);
