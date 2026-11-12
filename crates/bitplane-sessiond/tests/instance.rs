@@ -93,7 +93,7 @@ async fn the_serve_binary_answers_hello() {
         .iter()
         .map(|capability| capability.module.as_str())
         .collect();
-    assert_eq!(modules, ["session", "agent.claude"]);
+    assert_eq!(modules, ["session", "agent"]);
     assert!(hello.capabilities[0].available);
     child.start_kill().unwrap();
 }

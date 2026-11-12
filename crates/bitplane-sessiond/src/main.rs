@@ -3,7 +3,7 @@ use std::os::fd::{AsFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bitplane_sessiond::agent::{Agents, hook, wrapper};
+use bitplane_sessiond::agent::{Agents, hook};
 use bitplane_sessiond::autostart::connect_or_start;
 use bitplane_sessiond::client::Client;
 use bitplane_sessiond::paths::Dirs;
@@ -61,14 +61,28 @@ enum DevCommand {
 }
 
 fn main() -> ExitCode {
-    if wrapper::invoked() {
-        wrapper::run();
+    match Cli::parse().command {
+        Command::Hook => {
+            hook::forward();
+            ExitCode::SUCCESS
+        }
+        Command::Serve {
+            runtime_dir,
+            state_dir,
+        } => run(serve_daemon(runtime_dir, state_dir)),
+        Command::Dev {
+            socket,
+            no_start,
+            command,
+        } => run(dev_command(socket, no_start, command)),
     }
-    let cli = Cli::parse();
-    if let Command::Hook = cli.command {
-        hook::forward();
-        return ExitCode::SUCCESS;
-    }
+}
+
+/// Runs `command` on a tokio runtime with logging, as every subcommand but
+/// the hook forwarder does.
+fn run(
+    command: impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -77,7 +91,7 @@ fn main() -> ExitCode {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let result = runtime.block_on(run(cli));
+    let result = runtime.block_on(command);
     // Stdin is read on a blocking thread that never returns on its own.
     runtime.shutdown_background();
     match result {
@@ -89,66 +103,63 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match cli.command {
-        Command::Hook => hook::forward(),
-        Command::Serve {
-            runtime_dir,
-            state_dir,
-        } => {
-            // Both given: the host's env may lack XDG_RUNTIME_DIR and TMPDIR.
-            let dirs = match (runtime_dir, state_dir) {
-                (Some(runtime), Some(state)) => Dirs { runtime, state },
-                (runtime, state) => {
-                    let host = Dirs::for_host()?;
-                    Dirs {
-                        runtime: runtime.unwrap_or(host.runtime),
-                        state: state.unwrap_or(host.state),
-                    }
-                }
-            };
-            let config = Config {
-                dirs,
-                listener: activated_listener(),
-                peer_uid: rustix::process::getuid().as_raw(),
-                modules: vec![Sessions::module(), Agents::claude(std::env::current_exe()?)],
-                env: None,
-            };
-            serve(config, shutdown_signal()).await?;
-        }
-        Command::Dev {
-            socket,
-            no_start,
-            command,
-        } => {
-            let mut client = match socket {
-                Some(socket) => Client::connect(&socket).await?,
-                None if no_start => Client::connect(&Dirs::for_host()?.socket()).await?,
-                None => connect_or_start(&Dirs::for_host()?, &std::env::current_exe()?).await?,
-            };
-            let hello = client.hello("bitplane-sessiond dev").await?;
-            match command {
-                DevCommand::Hello => println!("{}", serde_json::to_string_pretty(&hello)?),
-                DevCommand::Call { method, params } => {
-                    let params = params.map(|text| serde_json::from_str(&text)).transpose()?;
-                    let result = client.call(&method, params).await?;
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                }
-                DevCommand::Events => dev::events(&mut client, tokio::io::stdout()).await?,
-                DevCommand::Attach { session } => {
-                    let size = terminal_size().unwrap_or((80, 24));
-                    let _raw = RawMode::enter();
-                    dev::attach(
-                        &mut client,
-                        &session,
-                        size,
-                        window_changes()?,
-                        tokio::io::stdin(),
-                        tokio::io::stdout(),
-                    )
-                    .await?;
-                }
+async fn serve_daemon(
+    runtime_dir: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Both given: the host's env may lack XDG_RUNTIME_DIR and TMPDIR.
+    let dirs = match (runtime_dir, state_dir) {
+        (Some(runtime), Some(state)) => Dirs { runtime, state },
+        (runtime, state) => {
+            let host = Dirs::for_host()?;
+            Dirs {
+                runtime: runtime.unwrap_or(host.runtime),
+                state: state.unwrap_or(host.state),
             }
+        }
+    };
+    let config = Config {
+        dirs,
+        listener: activated_listener(),
+        peer_uid: rustix::process::getuid().as_raw(),
+        modules: vec![Sessions::module(), Agents::claude(std::env::current_exe()?)],
+        env: None,
+    };
+    serve(config, shutdown_signal()).await?;
+    Ok(())
+}
+
+async fn dev_command(
+    socket: Option<PathBuf>,
+    no_start: bool,
+    command: DevCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = match socket {
+        Some(socket) => Client::connect(&socket).await?,
+        None if no_start => Client::connect(&Dirs::for_host()?.socket()).await?,
+        None => connect_or_start(&Dirs::for_host()?, &std::env::current_exe()?).await?,
+    };
+    let hello = client.hello("bitplane-sessiond dev").await?;
+    match command {
+        DevCommand::Hello => println!("{}", serde_json::to_string_pretty(&hello)?),
+        DevCommand::Call { method, params } => {
+            let params = params.map(|text| serde_json::from_str(&text)).transpose()?;
+            let result = client.call(&method, params).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        DevCommand::Events => dev::events(&mut client, tokio::io::stdout()).await?,
+        DevCommand::Attach { session } => {
+            let size = terminal_size().unwrap_or((80, 24));
+            let _raw = RawMode::enter();
+            dev::attach(
+                &mut client,
+                &session,
+                size,
+                window_changes()?,
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+            )
+            .await?;
         }
     }
     Ok(())

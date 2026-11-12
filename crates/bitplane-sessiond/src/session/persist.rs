@@ -34,8 +34,17 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvMap>,
     pub size: Size,
+    /// Set on an agent terminal (ADR 0029).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentLink>,
+    /// Where `session.open` asked the agent to start instead of the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cwd: Option<String>,
+    /// An agent terminal whose agent exited comes back exited with this code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited: Option<i32>,
 }
 
 /// What a daemon starts with: its own sessions, then other versions' after

@@ -4,7 +4,6 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 
-use super::{HOOK_SOCKET_VAR, HOOK_TOKEN_VAR, SESSION_VAR};
+use super::{HOOK_SOCKET_VAR, HOOK_TOKEN_VAR, SESSION_VAR, process, read_within};
 
 /// The forwarder's whole budget, well inside the 1.5 s Claude Code gives
 /// every `SessionEnd` hook together.
@@ -25,6 +24,12 @@ const MAX_MESSAGE: u64 = 8 << 20;
 pub struct Message {
     pub session: String,
     pub token: String,
+    /// The process that ran the hook and its parent, as the forwarder saw
+    /// them: which `claude` sent it, even after a shell between them exited.
+    #[serde(default)]
+    pub parent: Option<u32>,
+    #[serde(default)]
+    pub grandparent: Option<u32>,
     pub payload: Value,
 }
 
@@ -32,7 +37,10 @@ pub struct Message {
 /// [`FORWARD_TIMEOUT`], so it cannot stall the agent.
 pub fn forward() {
     let deadline = Instant::now() + FORWARD_TIMEOUT;
-    let Some(stdin) = read_stdin(deadline) else {
+    let parent = std::os::unix::process::parent_id();
+    let grandparent = process::parent(parent);
+    // The reader thread of a stdin that never closes dies with the process.
+    let Some(stdin) = read_within(std::io::stdin().take(MAX_MESSAGE), deadline) else {
         return;
     };
     let (Some(socket), Ok(session), Ok(token)) = (
@@ -48,6 +56,8 @@ pub fn forward() {
     let message = serde_json::to_vec(&Message {
         session,
         token,
+        parent: Some(parent),
+        grandparent,
         payload,
     })
     .expect("hook messages serialize");
@@ -94,20 +104,4 @@ pub async fn serve(listener: UnixListener, deliver: impl Fn(Message)) {
             Err(error) => tracing::debug!(%error, "dropped an unreadable hook message"),
         }
     }
-}
-
-/// `None` when stdin did not close in time; the reader thread dies with the process.
-fn read_stdin(deadline: Instant) -> Option<Vec<u8>> {
-    let (done, read) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = std::io::stdin()
-            .take(MAX_MESSAGE)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = done.send(result);
-    });
-    read.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()?
-        .ok()
 }

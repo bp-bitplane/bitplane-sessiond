@@ -1,6 +1,6 @@
 //! Just enough of the process tree to tell which session a pid runs in.
 
-/// Deeper than any shell, wrapper and agent chain.
+/// Deeper than any agent and its children.
 const MAX_DEPTH: usize = 64;
 
 /// Whether `pid` is `ancestor` or runs below it.
@@ -19,7 +19,7 @@ pub fn descends_from(pid: u32, ancestor: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn parent(pid: u32) -> Option<u32> {
+pub fn parent(pid: u32) -> Option<u32> {
     // SAFETY: proc_bsdinfo is plain old data; all zeroes is a valid value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -37,7 +37,7 @@ fn parent(pid: u32) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn parent(pid: u32) -> Option<u32> {
+pub fn parent(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat.rsplit_once(')')?
         .1
