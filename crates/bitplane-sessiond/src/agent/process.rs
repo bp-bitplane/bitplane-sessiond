@@ -1,6 +1,6 @@
 //! Just enough of the process tree to tell which session a pid runs in.
 
-/// Deeper than any shell, wrapper and agent chain.
+/// Deeper than any agent and its children.
 const MAX_DEPTH: usize = 64;
 
 /// Whether `pid` is `ancestor` or runs below it.

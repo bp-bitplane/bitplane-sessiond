@@ -173,9 +173,8 @@ impl Shared {
     }
 
     /// Lists the registry's agent in each due candidate session with
-    /// `tracking: poll`. The candidate stays while the registry lists an
-    /// agent without an id there, the foreground is named like the agent, or
-    /// it has not been given up on yet.
+    /// `tracking: poll`. The candidate stays until then: the session's PTY
+    /// child is the agent, and its exit drops the candidate.
     fn check_candidates(
         &self,
         state: &mut State,
@@ -183,13 +182,13 @@ impl Shared {
         joined: &Joined,
         snapshot: Instant,
     ) {
-        let due: Vec<(SessionId, Instant)> = state
+        let due: Vec<SessionId> = state
             .candidates
             .iter()
             .filter(|(_, candidate)| candidate.due <= snapshot)
-            .map(|(session, candidate)| (session.clone(), candidate.until))
+            .map(|(session, _)| session.clone())
             .collect();
-        for (session, until) in due {
+        for session in due {
             if has_live_agent(state, &session) {
                 state.candidates.remove(&session);
                 continue;
@@ -212,17 +211,9 @@ impl Shared {
                 .iter()
                 .find(|entry| Some(entry.pid) == processes.group)
                 .or(entries.first());
-            match entry {
-                Some(entry) if entry.agent_session.is_some() => {
-                    let entry = (*entry).clone();
-                    self.adopt(state, session, &entry);
-                }
-                Some(_) => {}
-                None if snapshot < until
-                    || processes.name.as_deref() == Some(self.adapter.kind()) => {}
-                None => {
-                    state.candidates.remove(&session);
-                }
+            if let Some(entry) = entry.filter(|entry| entry.agent_session.is_some()) {
+                let entry = (*entry).clone();
+                self.adopt(state, session, &entry);
             }
         }
     }
@@ -233,6 +224,7 @@ impl Shared {
             return;
         };
         let agent = Agent {
+            kind: self.adapter.kind().into(),
             agent_session,
             session: Some(session),
             cwd: entry.cwd.clone(),
@@ -245,7 +237,7 @@ impl Shared {
     }
 }
 
-/// Interactive entries to the session whose shell they run under.
+/// Interactive entries to the agent terminal whose PTY child they run under.
 fn join(live: &[LiveAgent], processes: &HashMap<SessionId, Processes>) -> Joined {
     let mut joined = Joined::new();
     for (index, entry) in live.iter().enumerate() {

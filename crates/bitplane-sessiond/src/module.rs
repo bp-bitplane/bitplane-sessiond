@@ -4,7 +4,6 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -41,18 +40,19 @@ pub trait Module: Send + Sync + 'static {
     fn start(&self, _context: ModuleContext) {}
 
     /// Called once every available module has started; work that reaches
-    /// other modules, such as spawning instrumented shells, starts here.
+    /// other modules, such as launching restored agent terminals, starts here.
     fn ready(&self) {}
 
-    /// What every shell a session starts gets from this module (ADR 0029).
-    fn instrument(&self, _session: &str) -> Option<Instrumentation> {
-        None
-    }
-
-    /// Takes over resuming `link` in the session's next shell (ADR 0031):
-    /// what to type, and the link as it now stands. `None` from a module
-    /// that runs no agents.
-    fn resume(&self, _session: &str, _link: &AgentLink) -> Option<Result<Resumed, RpcError>> {
+    /// What the agent terminal `session` runs as its PTY child, an agent of
+    /// `kind` resuming `link` (ADR 0029); `env` is the session's own. `None`
+    /// from a module that runs no agents of that kind.
+    fn launch(
+        &self,
+        _session: &str,
+        _kind: &str,
+        _env: &EnvMap,
+        _link: Option<&AgentLink>,
+    ) -> Option<Result<Launch, LaunchError>> {
         None
     }
 
@@ -101,7 +101,7 @@ pub struct Connection {
     pub frames: mpsc::UnboundedSender<Frame>,
 }
 
-/// The agent session a session's shell resumes, and where it started
+/// The agent session an agent terminal resumes, and where it started
 /// (ADR 0031); persisted with the session (ADR 0027).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,24 +110,27 @@ pub struct AgentLink {
     pub cwd: String,
 }
 
-/// What a session's shell is typed to resume its agent session.
+/// An agent terminal's PTY child: `argv[0]` is the agent's binary, `env`
+/// goes on top of the session's, and `link` is what it resumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Resumed {
-    pub link: AgentLink,
-    pub command: String,
+pub struct Launch {
+    pub argv: Vec<String>,
+    pub env: EnvMap,
+    pub link: Option<AgentLink>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LaunchError {
+    /// The request itself is wrong; a `session.open` fails with it.
+    Refused(RpcError),
+    /// The agent can't be launched now; the session is `spawnFailed`.
+    Failed(String),
 }
 
 /// Published on the bus whenever a module changed a session's agent link.
 #[derive(Debug, Clone)]
 pub struct AgentLinkChanged {
     pub session: String,
-}
-
-/// Env set and `PATH` entries prepended for a session's shell.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Instrumentation {
-    pub env: EnvMap,
-    pub path_prepend: Vec<PathBuf>,
 }
 
 pub struct ModuleContext {
@@ -140,7 +143,7 @@ pub struct ModuleContext {
     pub env: Arc<EnvMap>,
     pub events: Events,
     pub bus: Bus,
-    pub instruments: Instruments,
+    pub launchers: Launchers,
 }
 
 /// Broadcast events to every connection that completed `hello`.
@@ -151,11 +154,11 @@ pub struct Events(pub(crate) broadcast::Sender<Notification>);
 #[derive(Clone)]
 pub struct Bus(pub(crate) broadcast::Sender<Arc<dyn Any + Send + Sync>>);
 
-/// Every available module, for what a session's shells get from them:
-/// [`Module::instrument`], [`Module::resume`] and [`Module::agent_link`].
-/// Set before any `ready`; weak, as the modules hold it.
+/// Every available module, for what sessions get from them:
+/// [`Module::launch`] and [`Module::agent_link`]. Set before any `ready`;
+/// weak, as the modules hold it.
 #[derive(Clone, Default)]
-pub struct Instruments(Arc<OnceLock<Vec<Weak<dyn Module>>>>);
+pub struct Launchers(Arc<OnceLock<Vec<Weak<dyn Module>>>>);
 
 /// The namespace that owns INPUT frames.
 const FRAME_OWNER: &str = "session";
@@ -209,33 +212,19 @@ impl Bus {
     }
 }
 
-impl Instruments {
-    /// Adds what every module instruments a session's shell with to its env,
-    /// in module order.
-    pub fn apply(&self, session: &str, env: &mut EnvMap) {
-        let mut path = Vec::new();
-        for module in self.modules() {
-            let Some(Instrumentation {
-                env: added,
-                path_prepend,
-            }) = module.instrument(session)
-            else {
-                continue;
-            };
-            env.extend(added);
-            path.extend(path_prepend.iter().map(|dir| dir.display().to_string()));
-        }
-        if path.is_empty() {
-            return;
-        }
-        path.extend(env.get("PATH").filter(|path| !path.is_empty()).cloned());
-        env.insert("PATH".into(), path.join(":"));
-    }
-
-    /// The first module's [`Module::resume`]; `None` when no module runs agents.
-    pub fn resume(&self, session: &str, link: &AgentLink) -> Option<Result<Resumed, RpcError>> {
+impl Launchers {
+    /// The first module's [`Module::launch`]; with none running `kind`,
+    /// the session can't be launched.
+    pub fn launch(
+        &self,
+        session: &str,
+        kind: &str,
+        env: &EnvMap,
+        link: Option<&AgentLink>,
+    ) -> Result<Launch, LaunchError> {
         self.modules()
-            .find_map(|module| module.resume(session, link))
+            .find_map(|module| module.launch(session, kind, env, link))
+            .unwrap_or_else(|| Err(LaunchError::Failed(format!("unknown agent kind {kind}"))))
     }
 
     /// The session's agent link: the first module's decision, else `restored`.
@@ -258,7 +247,7 @@ impl Registry {
         events: Events,
     ) -> std::io::Result<Self> {
         let bus = Bus(broadcast::channel(256).0);
-        let instruments = Instruments::default();
+        let launchers = Launchers::default();
         let mut availability: HashMap<&'static str, Availability> = modules
             .iter()
             .map(|module| (module.namespace(), module.probe(&env)))
@@ -279,7 +268,7 @@ impl Registry {
                     env: env.clone(),
                     events: events.clone(),
                     bus: bus.clone(),
-                    instruments: instruments.clone(),
+                    launchers: launchers.clone(),
                 });
             }
             entries.push(Entry {
@@ -292,7 +281,7 @@ impl Registry {
             .filter(|entry| matches!(entry.availability, Availability::Available { .. }))
             .map(|entry| entry.module.clone())
             .collect();
-        let _ = instruments
+        let _ = launchers
             .0
             .set(available.iter().map(Arc::downgrade).collect());
         for module in available {
@@ -367,7 +356,7 @@ impl Registry {
     /// Every available module's [`Module::shutdown`], then every one's
     /// [`Module::terminate`], once; later calls do nothing. Sessions persist
     /// the agent links before the agent module stops taking hooks, and only
-    /// then are the shells hung up (ADR 0031).
+    /// then are the PTYs hung up (ADR 0031).
     pub fn shutdown(&self, restore: bool) {
         if self.shut_down.swap(true, Ordering::SeqCst) {
             return;

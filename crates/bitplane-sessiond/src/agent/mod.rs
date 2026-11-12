@@ -1,32 +1,33 @@
-//! The `agent.<kind>` modules: coding agents running inside daemon sessions,
-//! tracked through hooks injected per session and the agent's own polled
-//! registry (ADRs 0029–0031). Each agent kind is one [`AgentAdapter`]; this
-//! module owns everything kind-neutral.
+//! The `agent` module: agent terminals, whose PTY child is a coding agent
+//! launched with per-session hooks, tracked through those hooks and the
+//! agent's own polled registry (ADRs 0029–0031). Each agent kind is one
+//! [`AgentAdapter`]; this module owns everything kind-neutral.
 
 pub mod claude;
 pub mod hook;
 mod poll;
 mod process;
-pub mod wrapper;
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use bitplane_protocol::agent::{
-    Agent, AgentError, AgentListResult, AgentRef, AgentResult, AgentSessionId, AgentState,
-    Tracking, WaitingReason,
+    Agent, AgentError, AgentKindStatus, AgentListResult, AgentRef, AgentResult, AgentSessionId,
+    AgentState, Tracking, WaitingReason,
 };
 use bitplane_protocol::session::SessionId;
-use bitplane_protocol::{ErrorCode, RpcError};
+use bitplane_protocol::{ErrorCode, RpcError, method};
 use serde_json::{Value, json};
 
 use crate::env::EnvMap;
 use crate::module::{
-    AgentLink, AgentLinkChanged, Availability, BoxFuture, Bus, Call, Events, Instrumentation,
-    Module, ModuleContext, Resumed,
+    AgentLink, AgentLinkChanged, Availability, BoxFuture, Bus, Call, Events, Launch, LaunchError,
+    Module, ModuleContext,
 };
 use crate::session::{SessionClosed, SessionForeground};
 
@@ -34,39 +35,37 @@ use crate::session::{SessionClosed, SessionForeground};
 pub const HOOK_SOCKET_VAR: &str = "BITPLANE_HOOK_SOCKET";
 pub const HOOK_TOKEN_VAR: &str = "BITPLANE_HOOK_TOKEN";
 pub const SESSION_VAR: &str = "BITPLANE_SESSION_ID";
-/// How many graces past its due a candidate the registry has not listed is
-/// still asked about: an agent registers some time after it starts.
-const CANDIDATE_GRACES: u32 = 4;
-/// How many graces a resumed agent whose shell never ran anything stays
-/// `resuming`: the resume line failed before the agent could start.
-const RESUME_GRACES: u32 = 5;
+const NAMESPACE: &str = "agent";
+/// Where each agent terminal's hooks file lives, in the runtime dir.
+const HOOKS_DIR: &str = "agent-hooks";
 
-/// One agent kind's side of the module: how its sessions are wired up and
-/// what its hook payloads mean.
+/// One agent kind's side of the module: how its agent terminals are
+/// launched and what its hook payloads mean.
 pub trait AgentAdapter: Send + Sync + 'static {
     fn kind(&self) -> &'static str;
 
-    /// `agent.<kind>`.
-    fn namespace(&self) -> &'static str;
+    /// The agent's binary on `env`'s `PATH`, or why it can't be launched.
+    fn resolve(&self, env: &EnvMap) -> Result<PathBuf, String>;
 
-    /// Whether the agent is installed, looked up on the login-shell `PATH`.
-    fn available(&self, env: &EnvMap) -> Availability;
+    /// The settings that make every hook run `hook`, the forwarder command.
+    fn hooks(&self, hook: &str) -> Value;
 
-    /// Prepares `dir`, the module's own state dir, for [`Self::instrument`];
-    /// `exe` is the daemon binary the hooks run.
-    fn install(&self, dir: &Path, exe: &Path) -> std::io::Result<()>;
-
-    /// What a session's shell gets on top of the hook channel's env.
-    fn instrument(&self, dir: &Path) -> Instrumentation;
+    /// How `binary` is launched with the session's `hooks` file, resuming
+    /// `link`; the hook channel's env is added on top.
+    fn launch(&self, binary: &Path, hooks: &Path, link: Option<&AgentLink>) -> AgentCommand;
 
     fn ingest(&self, payload: &Value) -> Option<Ingested>;
 
     /// The agents the agent's own registry lists as running, host-wide;
     /// `None` when the registry could not be read. `env` is the login env.
     fn probe(&self, env: &EnvMap) -> Option<Vec<LiveAgent>>;
+}
 
-    /// What a shell started in `link.cwd` is typed to resume `link`.
-    fn resume_command(&self, link: &AgentLink) -> String;
+/// What an adapter launches: the binary first, then its arguments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentCommand {
+    pub argv: Vec<String>,
+    pub env: EnvMap,
 }
 
 /// A hook payload, read: the agent session it is about and what happened.
@@ -130,7 +129,8 @@ struct Shared {
     bus: Bus,
     env: Arc<EnvMap>,
     timing: Timing,
-    dir: PathBuf,
+    exe: PathBuf,
+    hooks_dir: PathBuf,
     hook_socket: PathBuf,
     state: Mutex<State>,
     /// Tells the poller its schedule may have changed.
@@ -142,7 +142,10 @@ struct Shared {
 
 #[derive(Default)]
 struct State {
-    /// The secret each session's hooks must present.
+    /// Each kind's availability as last reported.
+    kinds: HashMap<String, AgentKindStatus>,
+    /// The secret each agent terminal's hooks must present; only agent
+    /// terminals have one, and only they are tracked.
     tokens: HashMap<SessionId, String>,
     /// The agent session each session last started.
     current: HashMap<SessionId, AgentSessionId>,
@@ -150,9 +153,9 @@ struct State {
     links: HashMap<SessionId, Option<AgentLink>>,
     /// In start order.
     agents: Vec<Tracked>,
-    /// Each session's shell and terminal foreground, as last published.
+    /// Each agent terminal's PTY child and foreground, as last published.
     processes: HashMap<SessionId, Processes>,
-    /// Sessions whose foreground left the shell with no live agent in them.
+    /// Agent terminals launched with no live agent in them yet.
     candidates: HashMap<SessionId, Candidate>,
     /// When each session's last hook was handled.
     hooked: HashMap<SessionId, Instant>,
@@ -164,23 +167,19 @@ struct Tracked {
     /// Learnt from the registry.
     pid: Option<u32>,
     since: Instant,
-    /// The terminal's foreground left the shell since: a resumed agent ran.
-    ran: bool,
 }
 
-/// A foreground that may be an agent whose hooks did not load: the registry
-/// is asked from `due`, and given until `until` to list it there.
+/// A launch that may be an agent whose hooks did not load: the registry is
+/// asked from `due` for as long as the agent's process lives.
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     due: Instant,
-    until: Instant,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Processes {
     shell: Option<u32>,
     group: Option<u32>,
-    name: Option<String>,
 }
 
 impl Default for Timing {
@@ -193,7 +192,7 @@ impl Default for Timing {
 }
 
 impl Agents {
-    /// The `agent.claude` module; its hooks run `exe hook`.
+    /// The `agent` module with the Claude Code adapter; its hooks run `exe hook`.
     pub fn claude(exe: PathBuf) -> Arc<dyn Module> {
         Self::claude_with(exe, Timing::default())
     }
@@ -214,34 +213,38 @@ impl Agents {
 
 impl Module for Agents {
     fn namespace(&self) -> &'static str {
-        self.adapter.namespace()
+        NAMESPACE
     }
 
     fn dependencies(&self) -> &'static [&'static str] {
         &["session"]
     }
 
-    fn probe(&self, env: &EnvMap) -> Availability {
-        self.adapter.available(env)
+    /// Always available: a missing agent binary makes its kind unavailable
+    /// and its terminals `spawnFailed`, not the module (ADR 0029).
+    fn probe(&self, _env: &EnvMap) -> Availability {
+        Availability::Available { info: None }
     }
 
     fn start(&self, context: ModuleContext) {
-        if let Err(error) = self.adapter.install(&context.state_dir, &self.exe) {
-            tracing::warn!(%error, dir = %context.state_dir.display(), "couldn't install the agent wrapper");
-        }
         let shared = Arc::new(Shared {
             adapter: self.adapter.clone(),
             events: context.events,
             bus: context.bus.clone(),
             env: context.env,
             timing: self.timing,
-            dir: context.state_dir,
+            exe: self.exe.clone(),
+            hooks_dir: context.dirs.runtime.join(HOOKS_DIR),
             hook_socket: context.dirs.runtime.join("hook.sock"),
             state: Mutex::new(State::default()),
             wake: Arc::default(),
             stopped: AtomicBool::new(false),
             tasks: Mutex::new(Vec::new()),
         });
+        let initial = kind_status(shared.adapter.kind(), &shared.adapter.resolve(&shared.env));
+        let mut state = shared.state.lock().unwrap();
+        state.kinds.insert(initial.kind.clone(), initial);
+        drop(state);
         let weak = Arc::downgrade(&shared);
         let mut tasks = Vec::new();
         match hook::bind(&shared.hook_socket) {
@@ -263,27 +266,18 @@ impl Module for Agents {
         let _ = self.shared.set(shared);
     }
 
-    fn instrument(&self, session: &str) -> Option<Instrumentation> {
+    fn launch(
+        &self,
+        session: &str,
+        kind: &str,
+        env: &EnvMap,
+        link: Option<&AgentLink>,
+    ) -> Option<Result<Launch, LaunchError>> {
         let shared = self.shared.get()?;
-        let token = shared
-            .state
-            .lock()
-            .unwrap()
-            .tokens
-            .entry(session.to_string())
-            .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
-            .clone();
-        let mut instrumentation = shared.adapter.instrument(&shared.dir);
-        instrumentation.env.insert(
-            HOOK_SOCKET_VAR.into(),
-            shared.hook_socket.display().to_string(),
-        );
-        instrumentation.env.insert(HOOK_TOKEN_VAR.into(), token);
-        Some(instrumentation)
-    }
-
-    fn resume(&self, session: &str, link: &AgentLink) -> Option<Result<Resumed, RpcError>> {
-        Some(self.shared.get()?.resume(session, link))
+        if kind != shared.adapter.kind() {
+            return None;
+        }
+        Some(shared.launch(session, env, link))
     }
 
     fn agent_link(&self, session: &str) -> Option<Option<AgentLink>> {
@@ -294,8 +288,8 @@ impl Module for Agents {
     fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>> {
         Box::pin(async move {
             let shared = self.shared();
-            let list = format!("{}.list", self.adapter.namespace());
-            if call.method == list {
+            if call.method == method::AGENT_LIST {
+                let kinds = vec![shared.resolve(&shared.env).1];
                 let agents = shared
                     .state
                     .lock()
@@ -304,7 +298,7 @@ impl Module for Agents {
                     .iter()
                     .map(|tracked| tracked.agent.clone())
                     .collect();
-                return Ok(json!(AgentListResult { agents }));
+                return Ok(json!(AgentListResult { kinds, agents }));
             }
             Err(RpcError::new(
                 RpcError::METHOD_NOT_FOUND,
@@ -326,13 +320,85 @@ impl Module for Agents {
 }
 
 impl Shared {
-    /// Tracks `link`'s agent session as `resuming` in `session` (ADR 0030)
-    /// and makes it the session's link. An agent session running or
-    /// resuming in another session is refused.
-    fn resume(self: &Arc<Self>, session: &str, link: &AgentLink) -> Result<Resumed, RpcError> {
+    /// Launches the agent terminal `session`: its binary resolved on
+    /// `env`'s `PATH`, its own hooks file and token, and `link` resumed. A
+    /// launch replaces the session's previous agent process, so its agents
+    /// end. Resuming an agent session live in another session is refused.
+    fn launch(
+        self: &Arc<Self>,
+        session: &str,
+        env: &EnvMap,
+        link: Option<&AgentLink>,
+    ) -> Result<Launch, LaunchError> {
+        if let Some(link) = link {
+            self.check_resume(session, link)
+                .map_err(LaunchError::Refused)?;
+        }
+        let launched = Instant::now();
+        {
+            let mut state = self.state.lock().unwrap();
+            for tracked in state.agents.iter_mut().filter(|tracked| {
+                tracked.agent.session.as_deref() == Some(session) && tracked.since < launched
+            }) {
+                self.change(tracked, |agent| agent.state = AgentState::Exited);
+            }
+        }
+        let binary = match self.resolve(env) {
+            (Some(binary), _) => binary,
+            (None, status) => {
+                return Err(LaunchError::Failed(
+                    status.error.unwrap_or_else(|| "unavailable".into()),
+                ));
+            }
+        };
+        let hooks = self.hooks_dir.join(format!("{session}.json"));
+        let command = format!("{} hook", shell_quote(&self.exe.display().to_string()));
+        let settings =
+            serde_json::to_vec_pretty(&self.adapter.hooks(&command)).expect("settings serialize");
+        std::fs::create_dir_all(&self.hooks_dir)
+            .and_then(|()| write_private(&hooks, &settings))
+            .map_err(|error| {
+                LaunchError::Failed(format!("couldn't write {}: {error}", hooks.display()))
+            })?;
+        let mut state = self.state.lock().unwrap();
+        let token = state
+            .tokens
+            .entry(session.to_string())
+            .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
+            .clone();
+        let link = link.map(|link| self.resuming(&mut state, session, link));
+        drop(state);
+        let AgentCommand { argv, mut env } = self.adapter.launch(&binary, &hooks, link.as_ref());
+        env.insert(
+            HOOK_SOCKET_VAR.into(),
+            self.hook_socket.display().to_string(),
+        );
+        env.insert(HOOK_TOKEN_VAR.into(), token);
+        env.insert(SESSION_VAR.into(), session.to_string());
+        Ok(Launch { argv, env, link })
+    }
+
+    /// The kind's binary on `env`'s `PATH`, if any, and its status; a
+    /// status that changed is broadcast.
+    fn resolve(&self, env: &EnvMap) -> (Option<PathBuf>, AgentKindStatus) {
+        let resolved = self.adapter.resolve(env);
+        let status = kind_status(self.adapter.kind(), &resolved);
+        let mut state = self.state.lock().unwrap();
+        if state.kinds.get(&status.kind) != Some(&status) {
+            state.kinds.insert(status.kind.clone(), status.clone());
+            self.events
+                .emit(method::AGENT_KIND_CHANGED, json!(status.clone()));
+        }
+        (resolved.ok(), status)
+    }
+
+    /// Refuses resuming `link` in `session`: an id that isn't one, or an
+    /// agent session running or resuming in another session.
+    fn check_resume(&self, session: &str, link: &AgentLink) -> Result<(), RpcError> {
         let id = &link.agent_session;
-        // Typed into a shell, so only what an agent session id is made of.
+        // An argument after `--resume`; a leading `-` would read as an option.
         if id.is_empty()
+            || id.starts_with('-')
             || !id
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -342,12 +408,11 @@ impl Shared {
                 format!("{id:?} is not an agent session id"),
             ));
         }
-        let mut state = self.state.lock().unwrap();
-        let known = state
+        let state = self.state.lock().unwrap();
+        if let Some(other) = state
             .agents
             .iter()
-            .find(|tracked| tracked.agent.agent_session == *id);
-        if let Some(other) = known
+            .find(|tracked| tracked.agent.agent_session == *id)
             .filter(|tracked| tracked.agent.state != AgentState::Exited)
             .and_then(|tracked| tracked.agent.session.clone())
             .filter(|other| other != session)
@@ -358,11 +423,24 @@ impl Shared {
                 Some(json!({ "session": other })),
             ));
         }
+        Ok(())
+    }
+
+    /// Tracks `link`'s agent session as `resuming` in `session` (ADR 0030)
+    /// and makes it the session's link, with the cwd it is known to have
+    /// started in.
+    fn resuming(&self, state: &mut State, session: &str, link: &AgentLink) -> AgentLink {
+        let id = &link.agent_session;
+        let known = state
+            .agents
+            .iter()
+            .find(|tracked| tracked.agent.agent_session == *id);
         let link = AgentLink {
             agent_session: id.clone(),
             cwd: known.map_or_else(|| link.cwd.clone(), |tracked| tracked.agent.cwd.clone()),
         };
         let agent = Agent {
+            kind: self.adapter.kind().into(),
             agent_session: id.clone(),
             session: Some(session.to_string()),
             cwd: link.cwd.clone(),
@@ -371,47 +449,16 @@ impl Shared {
             last_error: None,
             tracking: Tracking::Hooks,
         };
-        self.start_agent(&mut state, agent, None);
-        let since = state
+        self.start_agent(state, agent, None);
+        if let Some(tracked) = state
             .agents
             .iter_mut()
             .find(|tracked| tracked.agent.agent_session == *id)
-            .map(|tracked| {
-                tracked.pid = None;
-                tracked.since
-            })
-            .expect("started above");
-        self.link(&mut state, session, Some(link.clone()));
-        drop(state);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let shared = Arc::downgrade(self);
-            let (session, id) = (session.to_string(), id.clone());
-            let wait = self.timing.grace * RESUME_GRACES;
-            runtime.spawn(async move {
-                tokio::time::sleep(wait).await;
-                if let Some(shared) = shared.upgrade() {
-                    shared.never_ran(&session, &id, since);
-                }
-            });
+        {
+            tracked.pid = None;
         }
-        Ok(Resumed {
-            command: self.adapter.resume_command(&link),
-            link,
-        })
-    }
-
-    /// A resumed agent whose shell never left the foreground has exited.
-    fn never_ran(&self, session: &str, agent_session: &str, since: Instant) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(tracked) = state.agents.iter_mut().find(|tracked| {
-            tracked.agent.agent_session == agent_session
-                && tracked.agent.session.as_deref() == Some(session)
-                && tracked.since == since
-                && tracked.agent.state == AgentState::Resuming
-                && !tracked.ran
-        }) {
-            self.change(tracked, |agent| agent.state = AgentState::Exited);
-        }
+        self.link(state, session, Some(link.clone()));
+        link
     }
 
     /// Sets the session's agent link and has the sessions saved.
@@ -451,6 +498,7 @@ impl Shared {
                     cwd: cwd.clone(),
                 };
                 let agent = Agent {
+                    kind: self.adapter.kind().into(),
                     agent_session,
                     session: Some(session.to_string()),
                     cwd,
@@ -515,7 +563,6 @@ impl Shared {
         let tracked = Tracked {
             pid: pid.or(existing.as_ref().and_then(|tracked| tracked.pid)),
             since: Instant::now(),
-            ran: false,
             agent: {
                 if let Some(existing) = &existing {
                     agent.name = agent.name.or(existing.agent.name.clone());
@@ -560,63 +607,46 @@ impl Shared {
         }
     }
 
-    /// A look at the session's shell and foreground. The shell in front,
-    /// or gone, ends every agent that started before (ADR 0030), except a
-    /// resumed one that has not run yet; the shell back in front also clears
-    /// the link to an agent it ended (ADR 0031). Anything else in front
-    /// with no live agent may be an agent without hooks.
+    /// A look at an agent terminal's PTY child, which is the agent itself
+    /// (ADR 0029); regular terminals are not tracked. The child gone ends
+    /// every agent that started before (ADR 0030). A new child with no live
+    /// agent may be an agent without hooks.
     fn foreground(&self, message: &SessionForeground) {
         let mut state = self.state.lock().unwrap();
+        if !state.tokens.contains_key(&message.session) {
+            return;
+        }
         let previous = state.processes.insert(
             message.session.clone(),
             Processes {
                 shell: message.shell,
                 group: message.group,
-                name: message.name.clone(),
             },
         );
-        let in_session = |tracked: &Tracked| {
-            tracked.agent.session.as_ref() == Some(&message.session) && tracked.since < message.at
-        };
-        if message.group.is_none() || message.group == message.shell {
+        if message.shell.is_none() {
             state.candidates.remove(&message.session);
-            let back = message.group.is_some();
-            let mut ended = Vec::new();
             for tracked in state.agents.iter_mut().filter(|tracked| {
-                in_session(tracked)
-                    && !(back && tracked.agent.state == AgentState::Resuming && !tracked.ran)
+                tracked.agent.session.as_ref() == Some(&message.session)
+                    && tracked.since < message.at
             }) {
                 self.change(tracked, |agent| agent.state = AgentState::Exited);
-                ended.push(tracked.agent.agent_session.clone());
-            }
-            let linked = state.links.get(&message.session).cloned().flatten();
-            if back && linked.is_some_and(|link| ended.contains(&link.agent_session)) {
-                self.link(&mut state, &message.session, None);
             }
             self.wake.notify_one();
             return;
         }
-        for tracked in state
-            .agents
-            .iter_mut()
-            .filter(|tracked| in_session(tracked))
-        {
-            tracked.ran = true;
-        }
-        let moved = previous.is_none_or(|previous| previous.group != message.group);
-        if moved && !has_live_agent(&state, &message.session) {
+        let launched = previous.is_none_or(|previous| previous.shell != message.shell);
+        if launched && !has_live_agent(&state, &message.session) {
             let due = message.at + self.timing.grace;
-            let candidate = Candidate {
-                due,
-                until: due + self.timing.grace * CANDIDATE_GRACES,
-            };
-            state.candidates.insert(message.session.clone(), candidate);
+            state
+                .candidates
+                .insert(message.session.clone(), Candidate { due });
         }
         self.wake.notify_one();
     }
 
     /// Its agents stay listed with no session, exited: the hang-up ended them.
     fn session_closed(&self, session: &str) {
+        let _ = std::fs::remove_file(self.hooks_dir.join(format!("{session}.json")));
         let mut state = self.state.lock().unwrap();
         state.tokens.remove(session);
         state.current.remove(session);
@@ -637,17 +667,13 @@ impl Shared {
     }
 
     fn emit_changed(&self, agent: Agent) {
-        self.events.emit(
-            &format!("{}.changed", self.adapter.namespace()),
-            json!(AgentResult { agent }),
-        );
+        self.events
+            .emit(method::AGENT_CHANGED, json!(AgentResult { agent }));
     }
 
     fn emit_removed(&self, agent_session: AgentSessionId) {
-        self.events.emit(
-            &format!("{}.removed", self.adapter.namespace()),
-            json!(AgentRef { agent_session }),
-        );
+        self.events
+            .emit(method::AGENT_REMOVED, json!(AgentRef { agent_session }));
     }
 }
 
@@ -680,4 +706,29 @@ fn has_live_agent(state: &State, session: &str) -> bool {
             tracked.agent.agent_session == *id && tracked.agent.state != AgentState::Exited
         })
     })
+}
+
+fn kind_status(kind: &str, resolved: &Result<PathBuf, String>) -> AgentKindStatus {
+    AgentKindStatus {
+        kind: kind.into(),
+        available: resolved.is_ok(),
+        error: resolved.as_ref().err().cloned(),
+    }
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// tmp + rename, owner-only.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    std::fs::rename(&tmp, path)
 }

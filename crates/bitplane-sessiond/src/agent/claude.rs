@@ -1,10 +1,9 @@
-//! The Claude Code adapter: a `claude` wrapper on each session's `PATH` that
-//! adds a `--settings` with our hooks (ADR 0029), and what those hooks mean
-//! (ADR 0030).
+//! The Claude Code adapter: Claude terminals launch `claude --settings
+//! <per-session hooks file>` (ADR 0029), and what those hooks mean (ADR 0030).
 
 use std::ffi::OsStr;
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -14,12 +13,10 @@ use bitplane_protocol::agent::{AgentError, AgentState, WaitingReason};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{AgentAdapter, AgentEvent, Ingested, LiveAgent};
+use super::{AgentAdapter, AgentCommand, AgentEvent, Ingested, LiveAgent};
 use crate::env::EnvMap;
-use crate::module::{AgentLink, Availability, Instrumentation};
+use crate::module::AgentLink;
 
-/// The generated settings file the wrapper passes to `claude`.
-pub const SETTINGS_VAR: &str = "BITPLANE_CLAUDE_SETTINGS";
 /// The events whose hooks drive agent state.
 pub const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -35,8 +32,6 @@ pub const HOOK_EVENTS: &[&str] = &[
 const HOOK_TIMEOUT_SECS: u64 = 2;
 /// `claude agents --json` takes ~0.1 s; a hung one is given up on.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const BIN_DIR: &str = "bin";
-const SETTINGS_FILE: &str = "settings.json";
 
 pub struct Claude;
 
@@ -45,43 +40,37 @@ impl AgentAdapter for Claude {
         "claude"
     }
 
-    fn namespace(&self) -> &'static str {
-        "agent.claude"
-    }
-
-    fn available(&self, env: &EnvMap) -> Availability {
+    fn resolve(&self, env: &EnvMap) -> Result<PathBuf, String> {
         let path = env.get("PATH").map(String::as_str).unwrap_or_default();
-        match find(OsStr::new(path), None) {
-            Some(claude) => Availability::Available {
-                info: Some(json!({ "path": claude })),
-            },
-            None => Availability::Unavailable {
-                reason: "claude not found on PATH; install Claude Code and restart the daemon"
-                    .into(),
-            },
-        }
+        find(OsStr::new(path)).ok_or_else(|| "claude not found on PATH; install Claude Code".into())
     }
 
-    fn install(&self, dir: &Path, exe: &Path) -> std::io::Result<()> {
-        let bin = dir.join(BIN_DIR);
-        std::fs::create_dir_all(&bin)?;
-        let link = bin.join("claude");
-        match std::fs::remove_file(&link) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-        std::os::unix::fs::symlink(exe, &link)?;
-        let settings = serde_json::to_vec_pretty(&settings(exe)).expect("settings serialize");
-        write_atomic(&dir.join(SETTINGS_FILE), &settings)
+    /// A `command` hook on every event in [`HOOK_EVENTS`].
+    fn hooks(&self, hook: &str) -> Value {
+        let group = json!([{
+            "hooks": [{ "type": "command", "command": hook, "timeout": HOOK_TIMEOUT_SECS }]
+        }]);
+        let hooks: serde_json::Map<String, Value> = HOOK_EVENTS
+            .iter()
+            .map(|event| (event.to_string(), group.clone()))
+            .collect();
+        json!({ "hooks": hooks })
     }
 
-    fn instrument(&self, dir: &Path) -> Instrumentation {
-        Instrumentation {
-            env: EnvMap::from([(
-                SETTINGS_VAR.into(),
-                dir.join(SETTINGS_FILE).display().to_string(),
-            )]),
-            path_prepend: vec![dir.join(BIN_DIR)],
+    /// Claude Code merges hook lists across settings levels, so the user's
+    /// own hooks still run next to these.
+    fn launch(&self, binary: &Path, hooks: &Path, link: Option<&AgentLink>) -> AgentCommand {
+        let mut argv = vec![
+            binary.display().to_string(),
+            "--settings".into(),
+            hooks.display().to_string(),
+        ];
+        if let Some(link) = link {
+            argv.extend(["--resume".into(), link.agent_session.clone()]);
+        }
+        AgentCommand {
+            argv,
+            env: EnvMap::new(),
         }
     }
 
@@ -131,8 +120,7 @@ impl AgentAdapter for Claude {
     }
 
     fn probe(&self, env: &EnvMap) -> Option<Vec<LiveAgent>> {
-        let path = env.get("PATH").map(String::as_str).unwrap_or_default();
-        let claude = find(OsStr::new(path), None)?;
+        let claude = self.resolve(env).ok()?;
         let mut command = Command::new(claude);
         command
             .args(["agents", "--json"])
@@ -141,30 +129,16 @@ impl AgentAdapter for Claude {
             .current_dir(env.get("HOME").map_or("/", String::as_str));
         parse_registry(&output(command, PROBE_TIMEOUT)?)
     }
-
-    fn resume_command(&self, link: &AgentLink) -> String {
-        format!("claude --resume {}\r", link.agent_session)
-    }
 }
 
-/// The first `claude` on `path` that is not a daemon's wrapper: neither
-/// `own` (the running binary, canonical) nor any `bitplane-sessiond*` binary.
-pub fn find(path: &OsStr, own: Option<&Path>) -> Option<PathBuf> {
+/// The first executable `claude` on `path`, as a shell would find it.
+pub fn find(path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
-        .filter(|dir| !dir.as_os_str().is_empty())
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("claude"))
         .find(|candidate| {
-            let Ok(target) = candidate.canonicalize() else {
-                return false;
-            };
-            let executable = std::fs::metadata(&target)
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
-            let wrapper = Some(target.as_path()) == own
-                || target
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.starts_with(crate::DAEMON_NAME));
-            executable && !wrapper
+            std::fs::metadata(candidate)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
 }
 
@@ -214,39 +188,6 @@ pub fn parse_registry(json: &[u8]) -> Option<Vec<LiveAgent>> {
     )
 }
 
-/// A `command` hook on every event in [`HOOK_EVENTS`], running `exe hook`.
-pub fn settings(exe: &Path) -> Value {
-    let command = format!("{} hook", shell_quote(&exe.display().to_string()));
-    let group = json!([{
-        "hooks": [{ "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS }]
-    }]);
-    let hooks: serde_json::Map<String, Value> = HOOK_EVENTS
-        .iter()
-        .map(|event| (event.to_string(), group.clone()))
-        .collect();
-    json!({ "hooks": hooks })
-}
-
-/// `user`'s settings with `ours`' hook groups appended per event; `None`
-/// when `user` is not an object or its `hooks` are malformed.
-pub fn merge(user: Value, ours: &Value) -> Option<Value> {
-    let Value::Object(mut merged) = user else {
-        return None;
-    };
-    let hooks = merged
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()?;
-    for (event, groups) in ours.get("hooks")?.as_object()? {
-        hooks
-            .entry(event.clone())
-            .or_insert_with(|| json!([]))
-            .as_array_mut()?
-            .extend(groups.as_array()?.iter().cloned());
-    }
-    Some(Value::Object(merged))
-}
-
 /// `command`'s stdout when it succeeds within `timeout`; it is killed otherwise.
 fn output(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
     let deadline = Instant::now() + timeout;
@@ -281,48 +222,40 @@ fn output(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
     }
 }
 
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn merging_keeps_the_users_settings_and_hooks_before_ours() {
-        let user = json!({
-            "model": "opus",
-            "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "notify" }] }] },
-        });
-        let ours = settings(Path::new("/opt/it's/bitplane-sessiond"));
+    fn claude_is_launched_with_its_hooks_file_and_resumes_by_argument() {
+        let hooks = Claude.hooks("'/opt/it'\\''s/bitplane-sessiond' hook");
+        for event in HOOK_EVENTS {
+            assert_eq!(
+                hooks["hooks"][event][0]["hooks"][0]["command"],
+                r"'/opt/it'\''s/bitplane-sessiond' hook"
+            );
+        }
 
-        let merged = merge(user, &ours).unwrap();
-
-        assert_eq!(merged["model"], "opus");
-        let stop = merged["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2);
-        assert_eq!(stop[0]["hooks"][0]["command"], "notify");
-        assert_eq!(
-            stop[1]["hooks"][0]["command"],
-            r"'/opt/it'\''s/bitplane-sessiond' hook"
+        let fresh = Claude.launch(Path::new("/bin/claude"), Path::new("/run/s1.json"), None);
+        let resumed = Claude.launch(
+            Path::new("/bin/claude"),
+            Path::new("/run/s1.json"),
+            Some(&AgentLink {
+                agent_session: "a1".into(),
+                cwd: "/r".into(),
+            }),
         );
+
+        assert_eq!(fresh.argv, ["/bin/claude", "--settings", "/run/s1.json"]);
         assert_eq!(
-            merged["hooks"]["SessionStart"],
-            ours["hooks"]["SessionStart"]
+            resumed.argv,
+            [
+                "/bin/claude",
+                "--settings",
+                "/run/s1.json",
+                "--resume",
+                "a1"
+            ]
         );
     }
 
@@ -400,13 +333,5 @@ mod tests {
                 })
             }
         );
-    }
-
-    #[test]
-    fn malformed_user_settings_are_not_merged() {
-        let ours = settings(Path::new("/bin/x"));
-        assert!(merge(json!([1]), &ours).is_none());
-        assert!(merge(json!({ "hooks": [] }), &ours).is_none());
-        assert!(merge(json!({ "hooks": { "Stop": {} } }), &ours).is_none());
     }
 }

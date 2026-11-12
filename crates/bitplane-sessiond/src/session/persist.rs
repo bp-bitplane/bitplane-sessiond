@@ -34,6 +34,9 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvMap>,
     pub size: Size,
+    /// Set on an agent terminal (ADR 0029).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentLink>,
 }

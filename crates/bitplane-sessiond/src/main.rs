@@ -3,7 +3,7 @@ use std::os::fd::{AsFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bitplane_sessiond::agent::{Agents, hook, wrapper};
+use bitplane_sessiond::agent::{Agents, hook};
 use bitplane_sessiond::autostart::connect_or_start;
 use bitplane_sessiond::client::Client;
 use bitplane_sessiond::paths::Dirs;
@@ -61,9 +61,6 @@ enum DevCommand {
 }
 
 fn main() -> ExitCode {
-    if wrapper::invoked() {
-        wrapper::run();
-    }
     let cli = Cli::parse();
     if let Command::Hook = cli.command {
         hook::forward();

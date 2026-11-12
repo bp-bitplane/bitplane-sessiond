@@ -1,4 +1,5 @@
-//! A session's shell on a PTY, with its reader, writer and waiter threads.
+//! A session's process on a PTY, with its reader, writer and waiter threads:
+//! the login shell, or the agent of an agent terminal.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -45,10 +46,11 @@ pub struct Foreground {
     pub busy: bool,
 }
 
-/// What a shell is started with, besides its environment.
+/// What the PTY child is started with.
 pub struct Spawn<'a> {
-    pub shell: &'a Path,
-    /// The session root, or where its agent link resumes.
+    /// The program, then its arguments.
+    pub argv: &'a [String],
+    /// The session root, or where its agent starts.
     pub cwd: &'a Path,
     pub env: EnvMap,
     pub size: Size,
@@ -59,7 +61,7 @@ pub struct Spawn<'a> {
 }
 
 impl Pty {
-    /// Starts the shell; `exited` runs on its own thread with the exit code.
+    /// Starts the child; `exited` runs on its own thread with the exit code.
     pub fn spawn(
         spawn: Spawn<'_>,
         exited: impl FnOnce(i32) + Send + 'static,
@@ -67,8 +69,9 @@ impl Pty {
         let pair = NativePtySystem::default()
             .openpty(pty_size(spawn.size))
             .map_err(|e| format!("couldn't open a terminal: {e}"))?;
-        let mut command = CommandBuilder::new(spawn.shell);
-        command.arg("-l");
+        let (program, args) = spawn.argv.split_first().ok_or("nothing to start")?;
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
         command.cwd(spawn.cwd);
         command.env_clear();
         for (key, value) in &spawn.env {
@@ -78,7 +81,7 @@ impl Pty {
         let mut child = pair
             .slave
             .spawn_command(command)
-            .map_err(|e| format!("couldn't start {}: {e}", spawn.shell.display()))?;
+            .map_err(|e| format!("couldn't start {program}: {e}"))?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
@@ -115,6 +118,7 @@ impl Pty {
         })
     }
 
+    /// The PTY child's: the shell, or an agent terminal's agent.
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid
     }

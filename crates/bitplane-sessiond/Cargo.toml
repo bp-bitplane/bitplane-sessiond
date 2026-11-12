@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "8eadd3a476fe8401fbd67e5db9869741e95d93db" }
+bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "5cdbe86698f61d87f906a1e1b53d458456e4ee43" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 libghostty-vt = "=0.2.2"
