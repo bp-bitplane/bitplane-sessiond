@@ -894,6 +894,12 @@ async fn an_exited_claude_terminal_comes_back_exited_with_its_link() {
     fixture
         .status_becomes(&id, json!({ "state": "exited", "code": 0 }))
         .await;
+    let before = fixture.list().await;
+    assert_eq!(
+        before[0]["state"],
+        json!({ "kind": "exited" }),
+        "{before:?}"
+    );
 
     let mut fixture = fixture.restart().await;
 
@@ -901,7 +907,7 @@ async fn an_exited_claude_terminal_comes_back_exited_with_its_link() {
         fixture.session_info(&id).await["status"],
         json!({ "state": "exited", "code": 0 })
     );
-    assert_eq!(fixture.list().await, Vec::<Value>::new());
+    assert_eq!(fixture.list().await, before, "listed as before the restart");
     assert!(!fixture.calls().contains("--resume"), "{}", fixture.calls());
     fixture
         .client
@@ -925,6 +931,8 @@ async fn without_claude_at_restore_the_session_fails_to_spawn_and_keeps_the_link
     let mut fixture = Fixture::start().await;
     let (id, mut screen) = fixture.claude_terminal(json!({})).await;
     fixture.say(&mut screen, "start a1 startup").await;
+    let mut agent = fixture.changed().await;
+    agent["state"] = json!({ "kind": "exited" });
     let later = fixture.home.path().join("later");
     std::fs::create_dir(&later).unwrap();
     let mut without = fixture.env.clone();
@@ -939,6 +947,7 @@ async fn without_claude_at_restore_the_session_fails_to_spawn_and_keeps_the_link
         json!("spawnFailed")
     );
     assert!(!fixture.calls().contains("--resume"));
+    assert_eq!(fixture.list().await, [agent]);
 
     executable(&later.join("claude"), FAKE_CLAUDE);
     fixture
@@ -1048,6 +1057,13 @@ async fn a_missing_cwd_fails_to_spawn_and_keeps_the_link() {
     assert_eq!(
         fixture.session_info(&id).await["status"]["state"],
         "spawnFailed"
+    );
+    assert_eq!(
+        fixture.list().await,
+        [
+            json!({ "kind": "claude", "agentSession": "a1", "session": id, "cwd": gone,
+                 "state": { "kind": "exited" }, "tracking": "hooks" })
+        ]
     );
     std::fs::create_dir(&gone).unwrap();
     fixture

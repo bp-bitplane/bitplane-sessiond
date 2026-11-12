@@ -343,14 +343,29 @@ impl Shared {
 
     /// Fresh processes for the restored sessions whose root is there,
     /// agent terminals resuming their agent links; an agent terminal whose
-    /// agent had exited stays exited.
+    /// agent had exited stays exited. A linked agent terminal left without a
+    /// process lists its agent exited.
     fn spawn_restored(self: &Arc<Self>) {
         let mut state = self.state.lock().unwrap();
         for entry in state.sessions.values_mut() {
-            if entry.pty.is_none() && !entry.info.root_gone && entry.exited.is_none() {
-                let launched = self.launch(entry);
+            let launched = (entry.pty.is_none() && !entry.info.root_gone && entry.exited.is_none())
+                .then(|| self.launch(entry));
+            if !launched.as_ref().is_some_and(Result::is_ok) {
+                self.restored_exited(entry);
+            }
+            if let Some(launched) = launched {
                 self.spawn(entry, launched);
             }
+        }
+    }
+
+    fn restored_exited(&self, entry: &Entry) {
+        let Some(SessionAgent { kind }) = &entry.info.agent else {
+            return;
+        };
+        let id = &entry.info.id;
+        if let Some(link) = self.launchers.agent_link(id, entry.agent.as_ref()) {
+            self.launchers.restored_exited(id, kind, &link);
         }
     }
 

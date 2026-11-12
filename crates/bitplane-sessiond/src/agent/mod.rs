@@ -293,6 +293,15 @@ impl Module for Agents {
         shared.state.lock().unwrap().links.get(session).cloned()
     }
 
+    fn restored_exited(&self, session: &str, kind: &str, link: &AgentLink) {
+        let Some(shared) = self.shared.get() else {
+            return;
+        };
+        if kind == shared.adapter.kind() {
+            shared.restored_exited(session, link);
+        }
+    }
+
     fn agent_cwd(&self, kind: &str, agent_session: &str) -> Option<String> {
         let shared = self.shared.get()?;
         if kind != shared.adapter.kind() {
@@ -481,6 +490,30 @@ impl Shared {
             tracked.pid = None;
         }
         self.link(state, session, link.clone());
+    }
+
+    /// Lists `link`'s agent session exited in `session`, as it was when it
+    /// exited live; one already tracked elsewhere is left alone.
+    fn restored_exited(&self, session: &str, link: &AgentLink) {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .agents
+            .iter()
+            .any(|tracked| tracked.agent.agent_session == link.agent_session)
+        {
+            return;
+        }
+        let agent = Agent {
+            kind: self.adapter.kind().into(),
+            agent_session: link.agent_session.clone(),
+            session: Some(session.to_string()),
+            cwd: link.cwd.clone(),
+            name: None,
+            state: AgentState::Exited,
+            last_error: None,
+            tracking: Tracking::Hooks,
+        };
+        self.start_agent(&mut state, agent, None);
     }
 
     /// Sets the session's agent link and has the sessions saved.

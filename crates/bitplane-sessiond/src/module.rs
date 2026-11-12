@@ -64,6 +64,10 @@ pub trait Module: Send + Sync + 'static {
         None
     }
 
+    /// The restored agent terminal `session` came back with `link` and no
+    /// process (ADR 0027); its agent is listed as it was, exited.
+    fn restored_exited(&self, _session: &str, _kind: &str, _link: &AgentLink) {}
+
     /// Where an agent session of `kind` this module knows started.
     fn agent_cwd(&self, _kind: &str, _agent_session: &str) -> Option<String> {
         None
@@ -239,6 +243,13 @@ impl Launchers {
         self.modules()
             .find_map(|module| module.agent_link(session))
             .or_else(|| restored.cloned())
+    }
+
+    /// Every module's [`Module::restored_exited`].
+    pub fn restored_exited(&self, session: &str, kind: &str, link: &AgentLink) {
+        for module in self.modules() {
+            module.restored_exited(session, kind, link);
+        }
     }
 
     /// Where a known agent session of `kind` started, if any module knows it.
