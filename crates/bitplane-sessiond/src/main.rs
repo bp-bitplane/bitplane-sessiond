@@ -3,6 +3,7 @@ use std::os::fd::{AsFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use bitplane_sessiond::agent::{Agents, hook};
 use bitplane_sessiond::autostart::connect_or_start;
 use bitplane_sessiond::client::Client;
 use bitplane_sessiond::paths::Dirs;
@@ -29,6 +30,8 @@ enum Command {
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+    /// Forward a hook payload on stdin to the daemon; run by the agent hooks.
+    Hook,
     /// Talk to a running daemon by hand.
     Dev {
         /// Connects to this socket instead, and never starts a daemon.
@@ -58,6 +61,11 @@ enum DevCommand {
 }
 
 fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Command::Hook = cli.command {
+        hook::forward();
+        return ExitCode::SUCCESS;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -66,7 +74,7 @@ fn main() -> ExitCode {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let result = runtime.block_on(run(Cli::parse()));
+    let result = runtime.block_on(run(cli));
     // Stdin is read on a blocking thread that never returns on its own.
     runtime.shutdown_background();
     match result {
@@ -80,6 +88,7 @@ fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        Command::Hook => hook::forward(),
         Command::Serve {
             runtime_dir,
             state_dir,
@@ -99,7 +108,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 dirs,
                 listener: activated_listener(),
                 peer_uid: rustix::process::getuid().as_raw(),
-                modules: vec![Sessions::module()],
+                modules: vec![Sessions::module(), Agents::claude(std::env::current_exe()?)],
                 env: None,
             };
             serve(config, shutdown_signal()).await?;

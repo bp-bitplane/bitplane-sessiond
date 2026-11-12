@@ -1,4 +1,5 @@
-//! A session's shell on a PTY, with its reader, writer and waiter threads.
+//! A session's process on a PTY, with its reader, writer and waiter threads:
+//! the login shell, or the agent of an agent terminal.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -40,14 +41,17 @@ pub struct Pty {
 /// The terminal's foreground process group, as cc's busy check sees it.
 pub struct Foreground {
     pub name: Option<String>,
+    pub group: u32,
     /// The group is not the shell's.
     pub busy: bool,
 }
 
-/// What a shell is started with, besides its environment.
+/// What the PTY child is started with.
 pub struct Spawn<'a> {
-    pub shell: &'a Path,
-    pub root: &'a Path,
+    /// The program, then its arguments.
+    pub argv: &'a [String],
+    /// The session root, or where its agent starts.
+    pub cwd: &'a Path,
     pub env: EnvMap,
     pub size: Size,
     /// Tags this PTY's output, so a restarted session's stream drops the old one's.
@@ -57,7 +61,7 @@ pub struct Spawn<'a> {
 }
 
 impl Pty {
-    /// Starts the shell; `exited` runs on its own thread with the exit code.
+    /// Starts the child; `exited` runs on its own thread with the exit code.
     pub fn spawn(
         spawn: Spawn<'_>,
         exited: impl FnOnce(i32) + Send + 'static,
@@ -65,9 +69,10 @@ impl Pty {
         let pair = NativePtySystem::default()
             .openpty(pty_size(spawn.size))
             .map_err(|e| format!("couldn't open a terminal: {e}"))?;
-        let mut command = CommandBuilder::new(spawn.shell);
-        command.arg("-l");
-        command.cwd(spawn.root);
+        let (program, args) = spawn.argv.split_first().ok_or("nothing to start")?;
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
+        command.cwd(spawn.cwd);
         command.env_clear();
         for (key, value) in &spawn.env {
             command.env(key, value);
@@ -76,7 +81,7 @@ impl Pty {
         let mut child = pair
             .slave
             .spawn_command(command)
-            .map_err(|e| format!("couldn't start {}: {e}", spawn.shell.display()))?;
+            .map_err(|e| format!("couldn't start {program}: {e}"))?;
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
@@ -106,10 +111,16 @@ impl Pty {
         let leader = self.master.process_group_leader()?;
         Some(Foreground {
             name: process_name(leader),
+            group: leader as u32,
             busy: self
                 .shell_pid
                 .is_some_and(|shell| shell as libc::pid_t != leader),
         })
+    }
+
+    /// The PTY child's: the shell, or an agent terminal's agent.
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
     }
 
     /// Queues one INPUT frame; the writer thread writes it whole.

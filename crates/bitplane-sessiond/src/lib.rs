@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod autostart;
 pub mod client;
 pub mod connection;

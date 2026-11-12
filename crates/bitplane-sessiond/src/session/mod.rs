@@ -1,6 +1,7 @@
-//! The `session` module: shells on PTYs the daemon owns, and attachments
-//! that show and type into them (ADRs 0025, 0026), persisted and restored
-//! as fresh shells across daemon restarts (ADR 0027).
+//! The `session` module: shells, and agent terminals' agents (ADR 0029), on
+//! PTYs the daemon owns, and attachments that show and type into them (ADRs
+//! 0025, 0026), persisted and restored as fresh processes across daemon
+//! restarts (ADR 0027).
 
 mod persist;
 mod pty;
@@ -10,13 +11,13 @@ mod stream;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitplane_protocol::session::{
     AttachmentAckParams, AttachmentError, AttachmentId, AttachmentOpenParams, AttachmentOpenResult,
-    AttachmentRef, AttachmentResizeParams, Session, SessionBusyResult, SessionId,
-    SessionListResult, SessionOpenParams, SessionRef, SessionRenameParams, SessionResult,
-    SessionStatus, Size,
+    AttachmentRef, AttachmentResizeParams, Session, SessionAgent, SessionBusyResult, SessionId,
+    SessionListResult, SessionOpenAgent, SessionOpenParams, SessionRef, SessionRenameParams,
+    SessionResult, SessionStatus, Size,
 };
 use bitplane_protocol::{ErrorCode, Frame, Notification, RpcError, method};
 use serde::Serialize;
@@ -25,9 +26,12 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::env::{self, EnvMap};
-use crate::module::{Availability, BoxFuture, Call, Connection, Events, Module, ModuleContext};
+use crate::module::{
+    AgentLink, AgentLinkChanged, Availability, BoxFuture, Bus, Call, Connection, Events, Launch,
+    LaunchError, Launchers, Module, ModuleContext,
+};
 
-use self::persist::{AgentLink, Persist, Record};
+use self::persist::{Persist, Record};
 use self::pty::{PARENT_SESSION_VARS, Pty, Spawn};
 use self::stream::Command;
 
@@ -39,6 +43,25 @@ const DEFAULT_SIZE: Size = Size { cols: 80, rows: 24 };
 /// an ancestor renamed or unmounted, which a watch on the root misses.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Published on the bus once a session is closed.
+#[derive(Debug, Clone)]
+pub struct SessionClosed {
+    pub session: SessionId,
+}
+
+/// Published on the bus on every look at a session's PTY child and its
+/// terminal's foreground process group, changed or not; both are `None`
+/// once the child is gone.
+#[derive(Debug, Clone)]
+pub struct SessionForeground {
+    pub session: SessionId,
+    /// The PTY child: the shell, or an agent terminal's agent.
+    pub shell: Option<u32>,
+    pub group: Option<u32>,
+    /// When the session was looked at.
+    pub at: Instant,
+}
+
 #[derive(Default)]
 pub struct Sessions {
     shared: OnceLock<Arc<Shared>>,
@@ -47,6 +70,8 @@ pub struct Sessions {
 struct Shared {
     env: Arc<EnvMap>,
     events: Events,
+    bus: Bus,
+    launchers: Launchers,
     state: Mutex<State>,
     persist: Persist,
 }
@@ -61,15 +86,22 @@ struct State {
 
 struct Entry {
     info: Session,
-    /// What every shell of the session starts with.
+    /// What every process of the session starts with.
     env: EnvMap,
     /// The env `session.open` was given, which a restore starts from.
     client_env: Option<EnvMap>,
+    /// The link the session was opened or restored with; an agent module's
+    /// own decision overrides it (ADR 0031).
     agent: Option<AgentLink>,
+    /// Where `session.open` asked the agent to start instead of the root.
+    cwd: Option<String>,
+    /// An agent terminal's exit code once its agent exited; it is restored
+    /// exited (ADR 0027).
+    exited: Option<i32>,
     stream: mpsc::Sender<Command>,
-    /// `None` once the shell exited or failed to start.
+    /// `None` once the process exited or failed to start.
     pty: Option<Pty>,
-    /// Counts the session's shells; a stale one's exit is ignored.
+    /// Counts the session's processes; a stale one's exit is ignored.
     generation: u64,
 }
 
@@ -100,13 +132,16 @@ impl Module for Sessions {
         Availability::Available { info: None }
     }
 
-    /// Restores every persisted session before returning, so the first
-    /// `session.list` is complete.
+    /// Registers every persisted session before returning, so the first
+    /// `session.list` is complete; their processes start in `ready`.
     fn start(&self, context: ModuleContext) {
         let restored = persist::restore(&context.dirs, &context.state_dir);
+        let links = context.bus.subscribe();
         let shared = Arc::new(Shared {
             env: context.env,
             events: context.events,
+            bus: context.bus,
+            launchers: context.launchers,
             state: Mutex::new(State::default()),
             persist: Persist::new(restored.file),
         });
@@ -114,6 +149,11 @@ impl Module for Sessions {
         let weak = Arc::downgrade(&shared);
         if self.shared.set(shared).is_ok() {
             let saver = weak.clone();
+            let relinked = weak.clone();
+            std::thread::Builder::new()
+                .name("session-links".into())
+                .spawn(move || follow_links(links, &relinked))
+                .expect("spawning a thread");
             std::thread::Builder::new()
                 .name("session-watch".into())
                 .spawn(move || watch(&weak))
@@ -125,9 +165,23 @@ impl Module for Sessions {
         }
     }
 
-    fn shutdown(&self, restore: bool) {
+    fn ready(&self) {
         if let Some(shared) = self.shared.get() {
-            shared.shutdown(restore);
+            shared.spawn_restored();
+        }
+    }
+
+    fn shutdown(&self, restore: bool) {
+        if let Some(shared) = self.shared.get()
+            && restore
+        {
+            shared.persist.close(Some(&shared.records()));
+        }
+    }
+
+    fn terminate(&self, restore: bool) {
+        if let Some(shared) = self.shared.get() {
+            shared.terminate(restore);
         }
     }
 
@@ -229,19 +283,39 @@ impl Shared {
                 None,
             ));
         }
+        let (kind, link, cwd) = match params.agent {
+            Some(SessionOpenAgent { kind, resume, cwd }) => {
+                let link = resume.map(|agent_session| AgentLink {
+                    cwd: cwd
+                        .clone()
+                        .or_else(|| self.launchers.agent_cwd(&kind, &agent_session))
+                        .unwrap_or_else(|| params.root.clone()),
+                    agent_session,
+                });
+                (Some(kind), link, cwd)
+            }
+            None => (None, None, None),
+        };
         let mut state = self.state.lock().unwrap();
-        state.next_seq += 1;
         let mut entry = self.entry(Record {
             id: uuid::Uuid::new_v4().to_string(),
-            seq: state.next_seq,
+            seq: state.next_seq + 1,
             root: params.root,
             plane: params.plane,
             name: user_name(params.name),
             env: params.env,
             size: DEFAULT_SIZE,
-            agent: None,
+            agent_kind: kind,
+            agent: link,
+            agent_cwd: cwd,
+            exited: None,
         });
-        self.spawn_shell(&mut entry);
+        let launched = match self.launch(&entry) {
+            Err(LaunchError::Refused(error)) => return Err(error),
+            launched => launched,
+        };
+        state.next_seq += 1;
+        self.spawn(&mut entry, launched);
         let info = entry.info.clone();
         state.sessions.insert(info.id.clone(), entry);
         self.persist.touch();
@@ -249,20 +323,71 @@ impl Shared {
         Ok(SessionResult { session: info })
     }
 
-    /// Fresh shells for persisted sessions, except where the root is gone.
+    /// Persisted sessions, without processes yet; where the root is gone
+    /// they get none.
     fn restore(self: &Arc<Self>, records: Vec<Record>) {
         let mut state = self.state.lock().unwrap();
         for record in records {
             state.next_seq = state.next_seq.max(record.seq);
             let mut entry = self.entry(record);
-            if Path::new(&entry.info.root).is_dir() {
-                self.spawn_shell(&mut entry);
-            } else {
+            if let Some(code) = entry.exited {
+                entry.info.status = SessionStatus::Exited { code };
+            }
+            if !Path::new(&entry.info.root).is_dir() {
                 entry.info.root_gone = true;
                 entry.info.status = SessionStatus::Exited { code: -1 };
             }
             state.sessions.insert(entry.info.id.clone(), entry);
         }
+    }
+
+    /// Fresh processes for the restored sessions whose root is there,
+    /// agent terminals resuming their agent links; an agent terminal whose
+    /// agent had exited stays exited. A linked agent terminal left without a
+    /// process lists its agent exited.
+    fn spawn_restored(self: &Arc<Self>) {
+        let mut state = self.state.lock().unwrap();
+        for entry in state.sessions.values_mut() {
+            let launched = (entry.pty.is_none() && !entry.info.root_gone && entry.exited.is_none())
+                .then(|| self.launch(entry));
+            if !launched.as_ref().is_some_and(Result::is_ok) {
+                self.restored_exited(entry);
+            }
+            if let Some(launched) = launched {
+                self.spawn(entry, launched);
+            }
+        }
+    }
+
+    fn restored_exited(&self, entry: &Entry) {
+        let Some(SessionAgent { kind }) = &entry.info.agent else {
+            return;
+        };
+        let id = &entry.info.id;
+        if let Some(link) = self.launchers.agent_link(id, entry.agent.as_ref()) {
+            self.launchers.restored_exited(id, kind, &link);
+        }
+    }
+
+    /// What an agent terminal's next process is and where it starts: its
+    /// link resumed in the link's cwd, else in the cwd it was opened with,
+    /// else in the root. `None` for a regular terminal.
+    fn launch(&self, entry: &Entry) -> Result<Option<(Launch, PathBuf)>, LaunchError> {
+        let Some(SessionAgent { kind }) = &entry.info.agent else {
+            return Ok(None);
+        };
+        let id = &entry.info.id;
+        let link = self.launchers.agent_link(id, entry.agent.as_ref());
+        let cwd = PathBuf::from(
+            link.as_ref()
+                .map(|link| &link.cwd)
+                .or(entry.cwd.as_ref())
+                .unwrap_or(&entry.info.root),
+        );
+        let launch = self
+            .launchers
+            .launch(id, kind, &entry.env, link.as_ref(), &cwd)?;
+        Ok(Some((launch, cwd)))
     }
 
     /// A session without a shell yet.
@@ -275,7 +400,10 @@ impl Shared {
             name,
             env: client_env,
             size,
+            agent_kind,
             agent,
+            agent_cwd,
+            exited,
         } = record;
         let env = session_env(&self.env, client_env.as_ref(), &id, plane.as_deref(), &root);
         let weak = Arc::downgrade(self);
@@ -290,6 +418,7 @@ impl Shared {
                 name,
                 title: None,
                 foreground: None,
+                agent: agent_kind.map(|kind| SessionAgent { kind }),
                 status: SessionStatus::Running,
                 root_gone: false,
                 size,
@@ -298,19 +427,17 @@ impl Shared {
             env,
             client_env,
             agent,
+            cwd: agent_cwd,
+            exited,
             stream,
             pty: None,
             generation: 0,
         }
     }
 
-    /// `restore` saves every session for the next instance before the shells
-    /// are hung up; otherwise they are hung up and forgotten.
-    fn shutdown(&self, restore: bool) {
+    /// Hangs up every process; without `restore` the sessions are then forgotten.
+    fn terminate(&self, restore: bool) {
         let mut state = self.state.lock().unwrap();
-        if restore {
-            self.persist.close(Some(&records(&state)));
-        }
         for entry in state.sessions.values_mut() {
             if let Some(pty) = entry.pty.take() {
                 pty.hang_up();
@@ -321,8 +448,8 @@ impl Shared {
         }
     }
 
-    /// Hangs up the shell if it still runs and starts a new one in the root,
-    /// under the same id, at the session's size.
+    /// Hangs up the process if it still runs and starts a new one under the
+    /// same id, at the session's size.
     fn restart(
         self: &Arc<Self>,
         SessionRef { session }: SessionRef,
@@ -351,7 +478,8 @@ impl Shared {
         }
         entry.info.root_gone = false;
         entry.info.title = None;
-        self.spawn_shell(entry);
+        let launched = self.launch(entry);
+        self.spawn(entry, launched);
         self.changed(&entry.info);
         Ok(SessionResult {
             session: entry.info.clone(),
@@ -394,31 +522,87 @@ impl Shared {
         })
     }
 
-    /// The stream starts afresh first, so it drops what the old shell still writes.
-    fn spawn_shell(self: &Arc<Self>, entry: &mut Entry) {
+    /// The stream starts afresh first, so it drops what the old process
+    /// still writes. A regular terminal runs the login shell in the root; an
+    /// agent terminal runs what it was `launched` with, where it was.
+    fn spawn(
+        self: &Arc<Self>,
+        entry: &mut Entry,
+        launched: Result<Option<(Launch, PathBuf)>, LaunchError>,
+    ) {
         entry.generation += 1;
         let generation = entry.generation;
         let size = entry.info.size;
         let _ = entry.stream.send(Command::Restart { generation, size });
-        let shell = env::resolve_shell(entry.env.get("SHELL").map(String::as_str));
         let weak = Arc::downgrade(self);
         let id = entry.info.id.clone();
-        let spawned = Pty::spawn(
-            Spawn {
-                shell: &shell,
-                root: Path::new(&entry.info.root),
-                env: entry.env.clone(),
-                size,
-                generation,
-                output: entry.stream.clone(),
-            },
-            move |code| exited(&weak, &id, generation, code),
-        );
+        let root = PathBuf::from(&entry.info.root);
+        let child = match launched {
+            Ok(None) => {
+                let shell = env::resolve_shell(entry.env.get("SHELL").map(String::as_str));
+                let argv = vec![shell.display().to_string(), "-l".into()];
+                Ok((argv, entry.env.clone(), root))
+            }
+            Ok(Some((Launch { argv, env }, cwd))) => {
+                let mut child_env = entry.env.clone();
+                child_env.extend(env);
+                Ok((argv, child_env, cwd))
+            }
+            Err(LaunchError::Refused(error)) => Err(error.message),
+            Err(LaunchError::Failed(error)) => Err(error),
+        };
+        let spawned = child.and_then(|(argv, env, cwd)| {
+            Pty::spawn(
+                Spawn {
+                    argv: &argv,
+                    cwd: &cwd,
+                    env,
+                    size,
+                    generation,
+                    output: entry.stream.clone(),
+                },
+                move |code| exited(&weak, &id, generation, code),
+            )
+        });
         entry.info.foreground = None;
+        if entry.exited.take().is_some() {
+            self.persist.touch();
+        }
         (entry.pty, entry.info.status) = match spawned {
             Ok(pty) => (Some(pty), SessionStatus::Running),
             Err(error) => (None, SessionStatus::SpawnFailed { error }),
         };
+        // Not left to the watch: an agent can start, work and quit within one
+        // tick, and the registry is joined by the PTY child's pid.
+        let child_pid = entry.pty.as_ref().and_then(Pty::shell_pid);
+        self.foreground(&entry.info.id, child_pid, child_pid, Instant::now());
+    }
+
+    /// Every session as the next instance restores it, with its agent link
+    /// as it stands now.
+    fn records(&self) -> Vec<Record> {
+        let state = self.state.lock().unwrap();
+        let mut records: Vec<Record> = state
+            .sessions
+            .values()
+            .map(|entry| Record {
+                id: entry.info.id.clone(),
+                seq: entry.info.seq,
+                root: entry.info.root.clone(),
+                plane: entry.info.plane.clone(),
+                name: entry.info.name.clone(),
+                env: entry.client_env.clone(),
+                size: entry.info.size,
+                agent_kind: entry.info.agent.as_ref().map(|agent| agent.kind.clone()),
+                agent: self
+                    .launchers
+                    .agent_link(&entry.info.id, entry.agent.as_ref()),
+                agent_cwd: entry.cwd.clone(),
+                exited: entry.exited,
+            })
+            .collect();
+        records.sort_by_key(|record| record.seq);
+        records
     }
 
     fn close(&self, SessionRef { session }: SessionRef) -> Result<(), RpcError> {
@@ -437,8 +621,12 @@ impl Shared {
         self.persist.touch();
         self.events.emit(
             method::SESSION_REMOVED,
-            serde_json::to_value(SessionRef { session }).expect("protocol types serialize"),
+            serde_json::to_value(SessionRef {
+                session: session.clone(),
+            })
+            .expect("protocol types serialize"),
         );
+        self.bus.publish(SessionClosed { session });
         Ok(())
     }
 
@@ -608,6 +796,15 @@ impl Shared {
         self.changed(&entry.info);
     }
 
+    fn foreground(&self, id: &str, shell: Option<u32>, group: Option<u32>, at: Instant) {
+        self.bus.publish(SessionForeground {
+            session: id.to_string(),
+            shell,
+            group,
+            at,
+        });
+    }
+
     fn changed(&self, session: &Session) {
         self.events.emit(
             method::SESSION_CHANGED,
@@ -634,7 +831,12 @@ fn exited(shared: &Weak<Shared>, id: &str, generation: u64, code: i32) {
     entry.pty = None;
     entry.info.foreground = None;
     entry.info.status = SessionStatus::Exited { code };
+    if entry.info.agent.is_some() {
+        entry.exited = Some(code);
+        shared.persist.touch();
+    }
     shared.changed(&entry.info);
+    shared.foreground(id, None, None, Instant::now());
 }
 
 fn retitled(shared: &Weak<Shared>, id: &str, title: Option<String>) {
@@ -657,28 +859,28 @@ fn save(shared: &Weak<Shared>) {
         if !shared.persist.due() {
             return;
         }
-        let records = records(&shared.state.lock().unwrap());
-        shared.persist.save(&records);
+        shared.persist.save(&shared.records());
     }
 }
 
-fn records(state: &State) -> Vec<Record> {
-    let mut records: Vec<Record> = state
-        .sessions
-        .values()
-        .map(|entry| Record {
-            id: entry.info.id.clone(),
-            seq: entry.info.seq,
-            root: entry.info.root.clone(),
-            plane: entry.info.plane.clone(),
-            name: entry.info.name.clone(),
-            env: entry.client_env.clone(),
-            size: entry.info.size,
-            agent: entry.agent.clone(),
-        })
-        .collect();
-    records.sort_by_key(|record| record.seq);
-    records
+/// Saves the sessions whenever another module changed an agent link.
+fn follow_links(
+    mut messages: tokio::sync::broadcast::Receiver<Arc<dyn std::any::Any + Send + Sync>>,
+    shared: &Weak<Shared>,
+) {
+    loop {
+        let changed = match messages.blocking_recv() {
+            Ok(message) => message.is::<AgentLinkChanged>(),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        if changed {
+            shared.persist.touch();
+        }
+    }
 }
 
 /// Polls every session's root and foreground process until the module is gone.
@@ -706,16 +908,19 @@ fn watch(shared: &Weak<Shared>) {
             let Some(entry) = state.sessions.get_mut(&id) else {
                 continue;
             };
-            let foreground = entry
+            let seen = Instant::now();
+            let shell = entry.pty.as_ref().and_then(Pty::shell_pid);
+            let (foreground, group) = entry
                 .pty
                 .as_ref()
                 .and_then(Pty::foreground)
-                .and_then(|fg| fg.name);
+                .map_or((None, None), |fg| (fg.name, Some(fg.group)));
             if entry.info.root_gone != gone || entry.info.foreground != foreground {
                 entry.info.root_gone = gone;
                 entry.info.foreground = foreground;
                 shared.changed(&entry.info);
             }
+            shared.foreground(&id, shell, group, seen);
         }
     }
 }
