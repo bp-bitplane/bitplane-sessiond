@@ -95,6 +95,9 @@ struct Entry {
     agent: Option<AgentLink>,
     /// Where `session.open` asked the agent to start instead of the root.
     cwd: Option<String>,
+    /// An agent terminal's exit code once its agent exited; it is restored
+    /// exited (ADR 0027).
+    exited: Option<i32>,
     stream: mpsc::Sender<Command>,
     /// `None` once the process exited or failed to start.
     pty: Option<Pty>,
@@ -283,8 +286,11 @@ impl Shared {
         let (kind, link, cwd) = match params.agent {
             Some(SessionOpenAgent { kind, resume, cwd }) => {
                 let link = resume.map(|agent_session| AgentLink {
+                    cwd: cwd
+                        .clone()
+                        .or_else(|| self.launchers.agent_cwd(&kind, &agent_session))
+                        .unwrap_or_else(|| params.root.clone()),
                     agent_session,
-                    cwd: cwd.clone().unwrap_or_else(|| params.root.clone()),
                 });
                 (Some(kind), link, cwd)
             }
@@ -301,8 +307,9 @@ impl Shared {
             size: DEFAULT_SIZE,
             agent_kind: kind,
             agent: link,
+            agent_cwd: cwd,
+            exited: None,
         });
-        entry.cwd = cwd;
         let launched = match self.launch(&entry) {
             Err(LaunchError::Refused(error)) => return Err(error),
             launched => launched,
@@ -323,6 +330,9 @@ impl Shared {
         for record in records {
             state.next_seq = state.next_seq.max(record.seq);
             let mut entry = self.entry(record);
+            if let Some(code) = entry.exited {
+                entry.info.status = SessionStatus::Exited { code };
+            }
             if !Path::new(&entry.info.root).is_dir() {
                 entry.info.root_gone = true;
                 entry.info.status = SessionStatus::Exited { code: -1 };
@@ -332,28 +342,37 @@ impl Shared {
     }
 
     /// Fresh processes for the restored sessions whose root is there,
-    /// agent terminals resuming their agent links.
+    /// agent terminals resuming their agent links; an agent terminal whose
+    /// agent had exited stays exited.
     fn spawn_restored(self: &Arc<Self>) {
         let mut state = self.state.lock().unwrap();
         for entry in state.sessions.values_mut() {
-            if entry.pty.is_none() && !entry.info.root_gone {
+            if entry.pty.is_none() && !entry.info.root_gone && entry.exited.is_none() {
                 let launched = self.launch(entry);
                 self.spawn(entry, launched);
             }
         }
     }
 
-    /// What an agent terminal's next process is, resuming its link; `None`
-    /// for a regular terminal.
-    fn launch(&self, entry: &Entry) -> Result<Option<Launch>, LaunchError> {
+    /// What an agent terminal's next process is and where it starts: its
+    /// link resumed in the link's cwd, else in the cwd it was opened with,
+    /// else in the root. `None` for a regular terminal.
+    fn launch(&self, entry: &Entry) -> Result<Option<(Launch, PathBuf)>, LaunchError> {
         let Some(SessionAgent { kind }) = &entry.info.agent else {
             return Ok(None);
         };
         let id = &entry.info.id;
         let link = self.launchers.agent_link(id, entry.agent.as_ref());
-        self.launchers
-            .launch(id, kind, &entry.env, link.as_ref())
-            .map(Some)
+        let cwd = PathBuf::from(
+            link.as_ref()
+                .map(|link| &link.cwd)
+                .or(entry.cwd.as_ref())
+                .unwrap_or(&entry.info.root),
+        );
+        let launch = self
+            .launchers
+            .launch(id, kind, &entry.env, link.as_ref(), &cwd)?;
+        Ok(Some((launch, cwd)))
     }
 
     /// A session without a shell yet.
@@ -368,6 +387,8 @@ impl Shared {
             size,
             agent_kind,
             agent,
+            agent_cwd,
+            exited,
         } = record;
         let env = session_env(&self.env, client_env.as_ref(), &id, plane.as_deref(), &root);
         let weak = Arc::downgrade(self);
@@ -391,7 +412,8 @@ impl Shared {
             env,
             client_env,
             agent,
-            cwd: None,
+            cwd: agent_cwd,
+            exited,
             stream,
             pty: None,
             generation: 0,
@@ -487,9 +509,12 @@ impl Shared {
 
     /// The stream starts afresh first, so it drops what the old process
     /// still writes. A regular terminal runs the login shell in the root; an
-    /// agent terminal runs what it was `launched` with, where `session.open`
-    /// asked, else in its link's cwd, else in the root.
-    fn spawn(self: &Arc<Self>, entry: &mut Entry, launched: Result<Option<Launch>, LaunchError>) {
+    /// agent terminal runs what it was `launched` with, where it was.
+    fn spawn(
+        self: &Arc<Self>,
+        entry: &mut Entry,
+        launched: Result<Option<(Launch, PathBuf)>, LaunchError>,
+    ) {
         entry.generation += 1;
         let generation = entry.generation;
         let size = entry.info.size;
@@ -503,22 +528,9 @@ impl Shared {
                 let argv = vec![shell.display().to_string(), "-l".into()];
                 Ok((argv, entry.env.clone(), root))
             }
-            Ok(Some(Launch { argv, env, link })) => {
+            Ok(Some((Launch { argv, env }, cwd))) => {
                 let mut child_env = entry.env.clone();
                 child_env.extend(env);
-                let cwd = entry
-                    .cwd
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        link.as_ref()
-                            .map(|link| PathBuf::from(&link.cwd))
-                            .filter(|cwd| cwd.is_dir())
-                    })
-                    .unwrap_or(root);
-                if let Some(link) = link {
-                    entry.agent = Some(link);
-                }
                 Ok((argv, child_env, cwd))
             }
             Err(LaunchError::Refused(error)) => Err(error.message),
@@ -538,6 +550,9 @@ impl Shared {
             )
         });
         entry.info.foreground = None;
+        if entry.exited.take().is_some() {
+            self.persist.touch();
+        }
         (entry.pty, entry.info.status) = match spawned {
             Ok(pty) => (Some(pty), SessionStatus::Running),
             Err(error) => (None, SessionStatus::SpawnFailed { error }),
@@ -567,6 +582,8 @@ impl Shared {
                 agent: self
                     .launchers
                     .agent_link(&entry.info.id, entry.agent.as_ref()),
+                agent_cwd: entry.cwd.clone(),
+                exited: entry.exited,
             })
             .collect();
         records.sort_by_key(|record| record.seq);
@@ -799,6 +816,10 @@ fn exited(shared: &Weak<Shared>, id: &str, generation: u64, code: i32) {
     entry.pty = None;
     entry.info.foreground = None;
     entry.info.status = SessionStatus::Exited { code };
+    if entry.info.agent.is_some() {
+        entry.exited = Some(code);
+        shared.persist.touch();
+    }
     shared.changed(&entry.info);
     shared.foreground(id, None, None, Instant::now());
 }

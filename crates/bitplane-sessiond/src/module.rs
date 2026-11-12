@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -43,22 +44,28 @@ pub trait Module: Send + Sync + 'static {
     /// other modules, such as launching restored agent terminals, starts here.
     fn ready(&self) {}
 
-    /// What the agent terminal `session` runs as its PTY child, an agent of
-    /// `kind` resuming `link` (ADR 0029); `env` is the session's own. `None`
-    /// from a module that runs no agents of that kind.
+    /// What the agent terminal `session` runs as its PTY child in `cwd`, an
+    /// agent of `kind` resuming `link` (ADR 0029); `env` is the session's
+    /// own. `None` from a module that runs no agents of that kind.
     fn launch(
         &self,
         _session: &str,
         _kind: &str,
         _env: &EnvMap,
         _link: Option<&AgentLink>,
+        _cwd: &Path,
     ) -> Option<Result<Launch, LaunchError>> {
         None
     }
 
-    /// The session's agent link as this module last decided it; `None` when
-    /// it has not, and the link the session was restored with stands.
-    fn agent_link(&self, _session: &str) -> Option<Option<AgentLink>> {
+    /// The session's agent link as this module last set it; `None` when it
+    /// has not, and the link the session was opened or restored with stands.
+    fn agent_link(&self, _session: &str) -> Option<AgentLink> {
+        None
+    }
+
+    /// Where an agent session of `kind` this module knows started.
+    fn agent_cwd(&self, _kind: &str, _agent_session: &str) -> Option<String> {
         None
     }
 
@@ -110,13 +117,12 @@ pub struct AgentLink {
     pub cwd: String,
 }
 
-/// An agent terminal's PTY child: `argv[0]` is the agent's binary, `env`
-/// goes on top of the session's, and `link` is what it resumes.
+/// An agent terminal's PTY child: `argv[0]` is the agent's binary, and
+/// `env` goes on top of the session's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub argv: Vec<String>,
     pub env: EnvMap,
-    pub link: Option<AgentLink>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,17 +227,24 @@ impl Launchers {
         kind: &str,
         env: &EnvMap,
         link: Option<&AgentLink>,
+        cwd: &Path,
     ) -> Result<Launch, LaunchError> {
         self.modules()
-            .find_map(|module| module.launch(session, kind, env, link))
+            .find_map(|module| module.launch(session, kind, env, link, cwd))
             .unwrap_or_else(|| Err(LaunchError::Failed(format!("unknown agent kind {kind}"))))
     }
 
-    /// The session's agent link: the first module's decision, else `restored`.
+    /// The session's agent link: the first module's, else `restored`.
     pub fn agent_link(&self, session: &str, restored: Option<&AgentLink>) -> Option<AgentLink> {
         self.modules()
             .find_map(|module| module.agent_link(session))
-            .unwrap_or_else(|| restored.cloned())
+            .or_else(|| restored.cloned())
+    }
+
+    /// Where a known agent session of `kind` started, if any module knows it.
+    pub fn agent_cwd(&self, kind: &str, agent_session: &str) -> Option<String> {
+        self.modules()
+            .find_map(|module| module.agent_cwd(kind, agent_session))
     }
 
     fn modules(&self) -> impl Iterator<Item = Arc<dyn Module>> + '_ {

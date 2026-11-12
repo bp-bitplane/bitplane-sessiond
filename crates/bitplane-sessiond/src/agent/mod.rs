@@ -152,8 +152,8 @@ struct State {
     tokens: HashMap<SessionId, String>,
     /// The agent session each session last started.
     current: HashMap<SessionId, AgentSessionId>,
-    /// Each session's agent link, once this module decided it (ADR 0031).
-    links: HashMap<SessionId, Option<AgentLink>>,
+    /// Each session's agent link, once this module set it (ADR 0031).
+    links: HashMap<SessionId, AgentLink>,
     /// In start order.
     agents: Vec<Tracked>,
     /// Each agent terminal's PTY child and foreground, as last published.
@@ -279,17 +279,31 @@ impl Module for Agents {
         kind: &str,
         env: &EnvMap,
         link: Option<&AgentLink>,
+        cwd: &Path,
     ) -> Option<Result<Launch, LaunchError>> {
         let shared = self.shared.get()?;
         if kind != shared.adapter.kind() {
             return None;
         }
-        Some(shared.launch(session, env, link))
+        Some(shared.launch(session, env, link, cwd))
     }
 
-    fn agent_link(&self, session: &str) -> Option<Option<AgentLink>> {
+    fn agent_link(&self, session: &str) -> Option<AgentLink> {
         let shared = self.shared.get()?;
         shared.state.lock().unwrap().links.get(session).cloned()
+    }
+
+    fn agent_cwd(&self, kind: &str, agent_session: &str) -> Option<String> {
+        let shared = self.shared.get()?;
+        if kind != shared.adapter.kind() {
+            return None;
+        }
+        let state = shared.state.lock().unwrap();
+        state
+            .agents
+            .iter()
+            .find(|tracked| tracked.agent.agent_session == agent_session)
+            .map(|tracked| tracked.agent.cwd.clone())
     }
 
     fn handle(&self, call: Call) -> BoxFuture<'_, Result<Value, RpcError>> {
@@ -327,8 +341,8 @@ impl Module for Agents {
 }
 
 impl Shared {
-    /// Launches the agent terminal `session`: its binary resolved on
-    /// `env`'s `PATH`, its own hooks file and token, and `link` resumed. A
+    /// Launches the agent terminal `session` in `cwd`: its binary resolved
+    /// on `env`'s `PATH`, its own hooks file and token, and `link` resumed. A
     /// launch replaces the session's previous agent process, so its agents
     /// end. Resuming an agent session live in another session is refused.
     fn launch(
@@ -336,6 +350,7 @@ impl Shared {
         session: &str,
         env: &EnvMap,
         link: Option<&AgentLink>,
+        cwd: &Path,
     ) -> Result<Launch, LaunchError> {
         if let Some(link) = link {
             self.check_resume(session, link)
@@ -358,6 +373,12 @@ impl Shared {
                 ));
             }
         };
+        if !cwd.is_dir() {
+            return Err(LaunchError::Failed(format!(
+                "{} is not a directory",
+                cwd.display()
+            )));
+        }
         let hooks = self.hooks_dir.join(format!("{session}.json"));
         let command = format!("{} hook", shell_quote(&self.exe.display().to_string()));
         let settings =
@@ -375,16 +396,18 @@ impl Shared {
             .clone();
         state.launches.insert(session.to_string(), launched);
         state.candidates.remove(session);
-        let link = link.map(|link| self.resuming(&mut state, session, link));
+        if let Some(link) = link {
+            self.resuming(&mut state, session, link);
+        }
         drop(state);
-        let AgentCommand { argv, mut env } = self.adapter.launch(&binary, &hooks, link.as_ref());
+        let AgentCommand { argv, mut env } = self.adapter.launch(&binary, &hooks, link);
         env.insert(
             HOOK_SOCKET_VAR.into(),
             self.hook_socket.display().to_string(),
         );
         env.insert(HOOK_TOKEN_VAR.into(), token);
         env.insert(SESSION_VAR.into(), session.to_string());
-        Ok(Launch { argv, env, link })
+        Ok(Launch { argv, env })
     }
 
     /// The kind's binary on `env`'s `PATH`, if any, and its status; a
@@ -436,18 +459,9 @@ impl Shared {
     }
 
     /// Tracks `link`'s agent session as `resuming` in `session` (ADR 0030)
-    /// and makes it the session's link, with the cwd it is known to have
-    /// started in.
-    fn resuming(&self, state: &mut State, session: &str, link: &AgentLink) -> AgentLink {
+    /// and makes it the session's link.
+    fn resuming(&self, state: &mut State, session: &str, link: &AgentLink) {
         let id = &link.agent_session;
-        let known = state
-            .agents
-            .iter()
-            .find(|tracked| tracked.agent.agent_session == *id);
-        let link = AgentLink {
-            agent_session: id.clone(),
-            cwd: known.map_or_else(|| link.cwd.clone(), |tracked| tracked.agent.cwd.clone()),
-        };
         let agent = Agent {
             kind: self.adapter.kind().into(),
             agent_session: id.clone(),
@@ -466,12 +480,11 @@ impl Shared {
         {
             tracked.pid = None;
         }
-        self.link(state, session, Some(link.clone()));
-        link
+        self.link(state, session, link.clone());
     }
 
     /// Sets the session's agent link and has the sessions saved.
-    fn link(&self, state: &mut State, session: &str, link: Option<AgentLink>) {
+    fn link(&self, state: &mut State, session: &str, link: AgentLink) {
         if state.links.get(session) == Some(&link) {
             return;
         }
@@ -520,7 +533,7 @@ impl Shared {
                 state.candidates.remove(session);
                 self.start_agent(&mut state, agent, None);
                 if source != "compact" {
-                    self.link(&mut state, session, Some(link));
+                    self.link(&mut state, session, link);
                 }
             }
             AgentEvent::Busy => self.update(&mut state, session, &agent_session, |agent| {
