@@ -5,7 +5,7 @@ date: 2026-11-09
 
 # Claude terminals launch `claude` with per-session `--settings`
 
-The `agent.claude` module (ADR 0023) tracks Claude Code agents in **Claude terminals**, and only there, without touching the user's Claude Code configuration. Every Claude Code fact below was checked against `claude` 2.1.318 and the official docs.
+The `agent` module (ADR 0023), through its `claude` kind, tracks Claude Code agents in **Claude terminals**, and only there, without touching the user's Claude Code configuration. Every Claude Code fact below was checked against `claude` 2.1.318 and the official docs.
 
 **A Claude terminal runs `claude` as the PTY child, with no shell.** `session.open { …, agent?: { kind, resume? } }` opens one; without `agent` the session is a regular terminal running the login shell, and gets no agent env, no token and no `PATH` change. `Session.agent?: { kind }` tells the two apart. The PTY child exiting is `claude` exiting, so the session becomes `exited { code }`. A `claude` the user starts by hand in a regular terminal is not tracked: no state, no link, no restore.
 
