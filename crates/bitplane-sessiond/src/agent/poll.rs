@@ -1,5 +1,6 @@
 //! The registry poll (ADR 0030): while any agent works, or runs without
-//! hooks, the agent's own registry is read and wins over the hooks.
+//! hooks, the agent's own registry is read and wins over the hooks; while
+//! any agent is live at all, it is read now and then to see `/bg`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -9,7 +10,7 @@ use bitplane_protocol::agent::{Agent, AgentState, Tracking};
 use bitplane_protocol::session::SessionId;
 use tokio::sync::Notify;
 
-use super::{LiveAgent, Processes, Shared, State, has_live_agent, process};
+use super::{LiveAgent, Processes, Shared, State, process};
 
 /// Probes whenever [`Shared::next_probe`] says so, until the module is gone.
 pub(super) async fn run(shared: Weak<Shared>, wake: Arc<Notify>) {
@@ -63,30 +64,41 @@ type Joined = HashMap<SessionId, Vec<usize>>;
 
 impl Shared {
     /// When the registry is next read: one poll interval after the last
-    /// read while any live agent is busy, waiting or without hooks, and
-    /// when a candidate session falls due; `None` when nothing needs it.
+    /// read while any agent is busy, waiting or tracked by poll, one live
+    /// interval after it while any agent is live, and when a candidate
+    /// falls due; `None` with no live agent and no candidate.
     fn next_probe(&self) -> Option<Instant> {
         let state = self.state.lock().unwrap();
-        let now = Instant::now();
-        let next_poll = state.last_probe.map_or(now, |last| last + self.timing.poll);
-        let working = state.agents.iter().any(|tracked| {
+        let after = |interval| {
+            state
+                .last_probe
+                .map_or_else(Instant::now, |last| last + interval)
+        };
+        let live = state.agents.iter().filter(|tracked| {
+            tracked.agent.session.is_some() && tracked.agent.state != AgentState::Exited
+        });
+        let working = live.clone().any(|tracked| {
             matches!(
                 tracked.agent.state,
                 AgentState::Busy | AgentState::Waiting { .. }
-            ) || (tracked.agent.tracking == Tracking::Poll
-                && tracked.agent.state != AgentState::Exited)
+            ) || tracked.agent.tracking == Tracking::Poll
         });
+        let polled = if working {
+            Some(after(self.timing.poll))
+        } else if live.clone().next().is_some() {
+            Some(after(self.timing.live))
+        } else {
+            None
+        };
         let candidate = state
             .candidates
             .values()
-            .map(|candidate| candidate.due)
+            .map(|candidate| candidate.due.max(after(self.timing.poll)))
             .min();
-        let due = match (working, candidate) {
-            (true, Some(candidate)) => Some(candidate.min(next_poll)),
-            (true, None) => Some(next_poll),
-            (false, candidate) => candidate,
-        };
-        due.map(|due| due.max(next_poll))
+        match (polled, candidate) {
+            (Some(polled), Some(candidate)) => Some(polled.min(candidate)),
+            (polled, candidate) => polled.or(candidate),
+        }
     }
 
     /// Applies a registry read that started at `snapshot`. A hook handled
@@ -119,6 +131,17 @@ impl Shared {
                 backgrounded.push((session, id));
                 continue;
             }
+            let child = state.processes.get(&session).and_then(|p| p.shell);
+            let vanished = tracked
+                .pid
+                .is_some_and(|pid| !child.is_some_and(|child| process::descends_from(pid, child)));
+            if vanished {
+                self.change(tracked, |agent| agent.state = AgentState::Exited);
+                continue;
+            }
+            if state.candidates.contains_key(&session) {
+                continue;
+            }
             let entry = entries
                 .iter()
                 .find(|entry| entry.agent_session.as_ref() == Some(&id))
@@ -127,13 +150,6 @@ impl Shared {
                     entries.iter().find(|entry| entry.pid == pid)
                 });
             let Some(entry) = entry else {
-                let shell = state.processes.get(&session).and_then(|p| p.shell);
-                let vanished = tracked.pid.is_some_and(|pid| {
-                    !shell.is_some_and(|shell| process::descends_from(pid, shell))
-                });
-                if vanished {
-                    self.change(tracked, |agent| agent.state = AgentState::Exited);
-                }
                 continue;
             };
             tracked.pid = Some(entry.pid);
@@ -173,8 +189,8 @@ impl Shared {
     }
 
     /// Lists the registry's agent in each due candidate session with
-    /// `tracking: poll`. The candidate stays until then: the session's PTY
-    /// child is the agent, and its exit drops the candidate.
+    /// `tracking: poll`, a resumed one included. The candidate stays until
+    /// then: the session's PTY child is the agent, and its exit drops it.
     fn check_candidates(
         &self,
         state: &mut State,
@@ -189,10 +205,6 @@ impl Shared {
             .map(|(session, _)| session.clone())
             .collect();
         for session in due {
-            if has_live_agent(state, &session) {
-                state.candidates.remove(&session);
-                continue;
-            }
             if state
                 .hooked
                 .get(&session)
@@ -223,6 +235,7 @@ impl Shared {
         let Some(agent_session) = entry.agent_session.clone() else {
             return;
         };
+        state.candidates.remove(&session);
         let agent = Agent {
             kind: self.adapter.kind().into(),
             agent_session,

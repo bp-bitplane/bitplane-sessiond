@@ -108,11 +108,14 @@ pub struct LiveAgent {
     pub background: bool,
 }
 
-/// How often the registry is polled, and how long a session's foreground
-/// may run the agent before missing hooks mean `tracking: poll` (ADR 0030).
+/// How often the registry is polled, and how long a launched agent may run
+/// without a `SessionStart` before it is tracked by poll (ADR 0030).
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
+    /// While any agent is busy, waiting or tracked by poll.
     pub poll: Duration,
+    /// While any agent is live at all, to see it moved to `/bg`.
+    pub live: Duration,
     pub grace: Duration,
 }
 
@@ -155,7 +158,10 @@ struct State {
     agents: Vec<Tracked>,
     /// Each agent terminal's PTY child and foreground, as last published.
     processes: HashMap<SessionId, Processes>,
-    /// Agent terminals launched with no live agent in them yet.
+    /// When each agent terminal was last launched, until its PTY child is
+    /// seen or a `SessionStart` arrives.
+    launches: HashMap<SessionId, Instant>,
+    /// Agent terminals launched with no `SessionStart` from them yet.
     candidates: HashMap<SessionId, Candidate>,
     /// When each session's last hook was handled.
     hooked: HashMap<SessionId, Instant>,
@@ -170,7 +176,7 @@ struct Tracked {
 }
 
 /// A launch that may be an agent whose hooks did not load: the registry is
-/// asked from `due` for as long as the agent's process lives.
+/// asked from `due` until a `SessionStart` or the agent's process ends it.
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     due: Instant,
@@ -186,6 +192,7 @@ impl Default for Timing {
     fn default() -> Self {
         Self {
             poll: Duration::from_secs(3),
+            live: Duration::from_secs(30),
             grace: Duration::from_secs(2),
         }
     }
@@ -366,6 +373,8 @@ impl Shared {
             .entry(session.to_string())
             .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
             .clone();
+        state.launches.insert(session.to_string(), launched);
+        state.candidates.remove(session);
         let link = link.map(|link| self.resuming(&mut state, session, link));
         drop(state);
         let AgentCommand { argv, mut env } = self.adapter.launch(&binary, &hooks, link.as_ref());
@@ -507,6 +516,8 @@ impl Shared {
                     last_error: None,
                     tracking: Tracking::Hooks,
                 };
+                state.launches.remove(session);
+                state.candidates.remove(session);
                 self.start_agent(&mut state, agent, None);
                 if source != "compact" {
                     self.link(&mut state, session, Some(link));
@@ -542,7 +553,6 @@ impl Shared {
     fn start_agent(&self, state: &mut State, mut agent: Agent, pid: Option<u32>) {
         let session = agent.session.clone().expect("started in a session");
         let id = agent.agent_session.clone();
-        state.candidates.remove(&session);
         if let Some(previous) = state
             .current
             .insert(session.clone(), id.clone())
@@ -609,8 +619,8 @@ impl Shared {
 
     /// A look at an agent terminal's PTY child, which is the agent itself
     /// (ADR 0029); regular terminals are not tracked. The child gone ends
-    /// every agent that started before (ADR 0030). A new child with no live
-    /// agent may be an agent without hooks.
+    /// every agent that started before (ADR 0030). A launched child that
+    /// sent no `SessionStart` yet may be an agent whose hooks are blocked.
     fn foreground(&self, message: &SessionForeground) {
         let mut state = self.state.lock().unwrap();
         if !state.tokens.contains_key(&message.session) {
@@ -634,9 +644,12 @@ impl Shared {
             self.wake.notify_one();
             return;
         }
-        let launched = previous.is_none_or(|previous| previous.shell != message.shell);
-        if launched && !has_live_agent(&state, &message.session) {
-            let due = message.at + self.timing.grace;
+        let new_child = previous.is_none_or(|previous| previous.shell != message.shell);
+        if let Some(launched) = new_child
+            .then(|| state.launches.remove(&message.session))
+            .flatten()
+        {
+            let due = launched + self.timing.grace;
             state
                 .candidates
                 .insert(message.session.clone(), Candidate { due });
@@ -652,6 +665,7 @@ impl Shared {
         state.current.remove(session);
         state.links.remove(session);
         state.processes.remove(session);
+        state.launches.remove(session);
         state.candidates.remove(session);
         state.hooked.remove(session);
         for tracked in state
@@ -697,15 +711,6 @@ async fn follow_sessions(bus: Bus, shared: Weak<Shared>) {
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
-}
-
-/// The session's agent is running, as far as anyone knows.
-fn has_live_agent(state: &State, session: &str) -> bool {
-    state.current.get(session).is_some_and(|id| {
-        state.agents.iter().any(|tracked| {
-            tracked.agent.agent_session == *id && tracked.agent.state != AgentState::Exited
-        })
-    })
 }
 
 fn kind_status(kind: &str, resolved: &Result<PathBuf, String>) -> AgentKindStatus {

@@ -19,6 +19,7 @@ use support::{Host, Screen, Stop, TestDaemon, next_event, open, shell_env};
 
 const DAEMON_EXE: &str = env!("CARGO_BIN_EXE_bitplane-sessiond");
 const POLL: Duration = Duration::from_millis(100);
+const LIVE: Duration = Duration::from_millis(1000);
 const GRACE: Duration = Duration::from_millis(500);
 
 /// Launched as a Claude terminal's PTY child, it checks its argv is exactly
@@ -503,9 +504,11 @@ async fn a_failed_turn_sets_last_error_until_the_next_prompt() {
 }
 
 #[tokio::test]
-async fn the_registry_is_polled_only_while_an_agent_works() {
+async fn the_registry_is_polled_often_while_an_agent_works_and_seldom_while_one_is_idle() {
     let mut fixture = Fixture::start().await;
-    let (_id, mut screen) = fixture.claude_terminal(json!({})).await;
+    tokio::time::sleep(POLL * 5).await;
+    assert_eq!(fixture.probes(), 0, "probed with no agent");
+    let (id, mut screen) = fixture.claude_terminal(json!({})).await;
     fixture.say(&mut screen, "start a1 startup").await;
     fixture.changed().await;
     fixture.say(&mut screen, "prompt").await;
@@ -518,13 +521,22 @@ async fn the_registry_is_polled_only_while_an_agent_works() {
     fixture.changed().await;
     tokio::time::sleep(POLL * 3).await;
     let settled = fixture.probes();
-    tokio::time::sleep(POLL * 10).await;
-
-    assert_eq!(
-        fixture.probes(),
-        settled,
-        "probed while every agent is idle"
+    tokio::time::sleep(LIVE * 5 / 2).await;
+    let idle = fixture.probes() - settled;
+    assert!(
+        (1..=3).contains(&idle),
+        "{idle} probes in 2.5 live intervals while every agent is idle"
     );
+
+    fixture
+        .client
+        .call("session.close", Some(json!({ "session": id })))
+        .await
+        .unwrap();
+    tokio::time::sleep(LIVE / 2).await;
+    let closed = fixture.probes();
+    tokio::time::sleep(LIVE * 2).await;
+    assert_eq!(fixture.probes(), closed, "probed with no live agent");
 }
 
 #[tokio::test]
@@ -583,6 +595,38 @@ async fn without_hooks_the_agent_is_tracked_from_the_registry() {
 }
 
 #[tokio::test]
+async fn without_hooks_a_resumed_agent_is_tracked_from_the_registry() {
+    let mut fixture = Fixture::start().await;
+    let (id, mut screen) = fixture
+        .claude_terminal_with(json!({ "resume": "a1" }), json!({ "FAKE_NO_HOOKS": "1" }))
+        .await;
+
+    assert_eq!(fixture.changed().await["state"]["kind"], "resuming");
+    let agent = fixture.changed_within(Duration::from_secs(5)).await;
+    assert_eq!(
+        (
+            &agent["agentSession"],
+            &agent["session"],
+            &agent["state"],
+            &agent["tracking"]
+        ),
+        (
+            &json!("a1"),
+            &json!(id),
+            &json!({ "kind": "idle" }),
+            &json!("poll")
+        )
+    );
+
+    fixture.say(&mut screen, "reg busy").await;
+    let agent = fixture.changed_within(Duration::from_secs(3)).await;
+    assert_eq!(
+        (&agent["state"], &agent["tracking"]),
+        (&json!({ "kind": "busy" }), &json!("poll"))
+    );
+}
+
+#[tokio::test]
 async fn claude_exiting_exits_the_session_and_its_agent() {
     let mut fixture = Fixture::start().await;
     let (id, mut screen) = fixture.claude_terminal(json!({})).await;
@@ -617,17 +661,15 @@ async fn an_agent_whose_pid_vanishes_exits() {
 }
 
 #[tokio::test]
-async fn an_agent_moved_to_bg_exits() {
+async fn an_agent_moved_to_bg_exits_even_while_every_agent_is_idle() {
     let mut fixture = Fixture::start().await;
     let (_id, mut screen) = fixture.claude_terminal(json!({})).await;
     fixture.say(&mut screen, "start a1 startup").await;
     fixture.changed().await;
-    fixture.say(&mut screen, "prompt").await;
-    fixture.changed().await;
 
     fixture.say(&mut screen, "bg").await;
 
-    let agent = fixture.changed_within(Duration::from_secs(3)).await;
+    let agent = fixture.changed_within(LIVE * 3).await;
     assert_eq!(
         (&agent["agentSession"], &agent["state"]),
         (&json!("a1"), &json!({ "kind": "exited" }))
@@ -1100,6 +1142,7 @@ fn modules() -> Vec<std::sync::Arc<dyn bitplane_sessiond::module::Module>> {
             PathBuf::from(DAEMON_EXE),
             Timing {
                 poll: POLL,
+                live: LIVE,
                 grace: GRACE,
             },
         ),
