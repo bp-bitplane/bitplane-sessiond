@@ -8,10 +8,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "5cfec70a49817ef1a003d8ccd119af063d94b64f" }
+base64 = "0.22"
+bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "aec2d165f836ee53368019a0c6ed43f47e2abde2" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 libghostty-vt = "=0.2.2"
+notify-debouncer-mini = "0.7"
 portable-pty = "0.9"
 rustix = { version = "1", features = ["fs", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
