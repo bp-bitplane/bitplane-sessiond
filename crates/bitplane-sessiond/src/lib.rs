@@ -5,6 +5,7 @@ pub mod connection;
 pub mod dev;
 pub mod env;
 pub mod fs;
+pub mod git;
 pub mod git_cli;
 pub mod module;
 pub mod paths;

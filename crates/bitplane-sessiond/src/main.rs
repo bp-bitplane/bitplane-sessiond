@@ -7,6 +7,7 @@ use bitplane_sessiond::agent::{Agents, hook};
 use bitplane_sessiond::autostart::connect_or_start;
 use bitplane_sessiond::client::Client;
 use bitplane_sessiond::fs::Fs;
+use bitplane_sessiond::git::Git;
 use bitplane_sessiond::paths::Dirs;
 use bitplane_sessiond::server::{Config, serve};
 use bitplane_sessiond::session::Sessions;
@@ -113,6 +114,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Sessions::module(),
                     Agents::claude(std::env::current_exe()?),
                     Fs::module(),
+                    Git::module(),
                 ],
                 env: None,
             };
