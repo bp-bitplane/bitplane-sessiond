@@ -7,7 +7,7 @@ use std::time::Duration;
 use bitplane_protocol::{
     DaemonInfo, DaemonShutdownParams, ErrorCode, Frame, HelloParams, HelloResult, Id,
     MIN_PROTOCOL_VERSION, Message, Notification, PROTOCOL_VERSION, Request, Response, RpcError,
-    decode_envelope, hello::negotiate, method,
+    decode_envelope, hello::negotiate, job::JobClient, method,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +28,11 @@ pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) 
     let (mut reader, writer) = stream.into_split();
     let (frames, outgoing) = mpsc::unbounded_channel();
     let writer = tokio::spawn(write_frames(writer, outgoing));
-    let connection = Connection { id, frames };
+    let mut connection = Connection {
+        id,
+        frames,
+        client: None,
+    };
 
     let mut forwarder = None;
     let mut stopping = false;
@@ -47,7 +51,8 @@ pub async fn serve_connection(stream: UnixStream, id: u64, shared: Arc<Shared>) 
             let helloed = forwarder.is_some();
             match (frame, helloed) {
                 (Frame::Json(bytes), false) => match hello(&bytes, &shared) {
-                    Ok(response) => {
+                    Ok((response, client)) => {
+                        connection.client = Some(client);
                         send(&connection, &response);
                         forwarder = Some(tokio::spawn(forward_events(
                             shared.events.subscribe(),
@@ -101,7 +106,7 @@ enum Handled {
 
 /// The reply to the connection's first message: `Ok` opens the connection,
 /// `Err` is sent and then the connection closes.
-fn hello(bytes: &[u8], shared: &Shared) -> Result<Response, Response> {
+fn hello(bytes: &[u8], shared: &Shared) -> Result<(Response, JobClient), Response> {
     let request = match serde_json::from_slice::<Message>(bytes) {
         Ok(Message::Request(request)) if request.method == method::HELLO => request,
         Ok(Message::Request(request)) => return Err(hello_required(Some(request.id))),
@@ -132,9 +137,16 @@ fn hello(bytes: &[u8], shared: &Shared) -> Result<Response, Response> {
         daemon: shared.daemon.clone(),
         capabilities: shared.registry.capabilities(),
     };
-    Ok(Response::ok(
-        request.id,
-        serde_json::to_value(result).expect("hello result serializes"),
+    let client = JobClient {
+        name: params.client.name,
+        version: params.client.version,
+    };
+    Ok((
+        Response::ok(
+            request.id,
+            serde_json::to_value(result).expect("hello result serializes"),
+        ),
+        client,
     ))
 }
 
@@ -176,7 +188,6 @@ fn handle_message(bytes: &[u8], connection: &Connection, shared: &Arc<Shared>) -
         }
         return Handled::Shutdown;
     }
-    let shared = shared.clone();
     let reply = Reply::new(id, connection.frames.clone());
     let call = Call {
         method,
@@ -184,6 +195,11 @@ fn handle_message(bytes: &[u8], connection: &Connection, shared: &Arc<Shared>) -
         connection: connection.clone(),
         reply: reply.clone(),
     };
+    if call.method.starts_with("job.") {
+        reply.send(shared.registry.jobs().handle(&call));
+        return Handled::Dispatched;
+    }
+    let shared = shared.clone();
     tokio::spawn(async move {
         reply.send(shared.registry.dispatch(call).await);
     });

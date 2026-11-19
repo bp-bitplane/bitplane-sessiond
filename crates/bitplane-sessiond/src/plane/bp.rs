@@ -2,6 +2,7 @@
 //! `Request` on stdin, in the captured environment.
 
 use std::ffi::OsStr;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,12 +12,13 @@ use bitplane_protocol::plane::BpVersion;
 use bitplane_protocol::{ErrorCode, RpcError};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use crate::env::EnvMap;
 
 pub const NO_BP: &str = "bp not found on PATH; install it and restart the daemon";
 
+const PROGRESS_FD: i32 = 3;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TAIL_LINES: usize = 20;
 const TAIL_BYTES: usize = 2000;
@@ -88,23 +90,8 @@ impl Bp {
     /// One request. A run is never killed: a dropped caller only loses the
     /// answer, as a `bp` stopped mid-mutation would leave work behind.
     pub async fn run(&self, request: &Value) -> Result<Value, Failure> {
-        let mut command = Command::new(&self.program);
-        command
-            .arg("--stdin")
-            .arg("--json")
-            .arg("--planes-dir")
-            .arg(&self.planes_dir)
-            .env_clear()
-            .envs(&self.env)
-            .current_dir(self.env.get("HOME").map_or("/", String::as_str))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // SAFETY: setsid is async-signal-safe and touches no parent state.
-        unsafe {
-            command.pre_exec(|| rustix::process::setsid().map(drop).map_err(Into::into));
-        }
-        let mut child = command
+        let mut child = self
+            .command()
             .spawn()
             .map_err(|error| Failure::NotRun(format!("couldn't start bp: {error}")))?;
         if let Some(mut stdin) = child.stdin.take() {
@@ -121,6 +108,57 @@ impl Bp {
             &output.stdout,
             &String::from_utf8_lossy(&output.stderr),
         )
+    }
+}
+
+impl Bp {
+    /// `bp` with `--progress-fd 3`, its progress pipe's read end, and the
+    /// request yet to be written to its stdin.
+    pub fn spawn_with_progress(&self) -> std::io::Result<(Child, OwnedFd)> {
+        let (reader, writer) = std::io::pipe()?;
+        let progress = writer.as_raw_fd();
+        let mut command = self.command();
+        command.arg("--progress-fd").arg(PROGRESS_FD.to_string());
+        // SAFETY: dup2 and fcntl are async-signal-safe and touch no parent state.
+        unsafe {
+            command.pre_exec(move || {
+                if progress == PROGRESS_FD {
+                    // dup2 onto itself would keep the fd close-on-exec.
+                    let flags = libc::fcntl(progress, libc::F_GETFD);
+                    if flags < 0
+                        || libc::fcntl(progress, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(progress, PROGRESS_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn()?;
+        drop(writer);
+        Ok((child, reader.into()))
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command
+            .arg("--stdin")
+            .arg("--json")
+            .arg("--planes-dir")
+            .arg(&self.planes_dir)
+            .env_clear()
+            .envs(&self.env)
+            .current_dir(self.env.get("HOME").map_or("/", String::as_str))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: setsid is async-signal-safe and touches no parent state.
+        unsafe {
+            command.pre_exec(|| rustix::process::setsid().map(drop).map_err(Into::into));
+        }
+        command
     }
 }
 
