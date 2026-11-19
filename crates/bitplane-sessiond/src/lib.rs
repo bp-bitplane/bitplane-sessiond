@@ -10,6 +10,7 @@ pub mod git_cli;
 pub mod module;
 pub mod paths;
 pub mod pidfile;
+pub mod plane;
 pub mod server;
 pub mod session;
 pub mod watch;

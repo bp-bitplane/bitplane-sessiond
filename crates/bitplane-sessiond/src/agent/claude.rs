@@ -189,7 +189,7 @@ pub fn parse_registry(json: &[u8]) -> Option<Vec<LiveAgent>> {
 }
 
 /// `command`'s stdout when it succeeds within `timeout`; it is killed otherwise.
-fn output(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
+pub(crate) fn output(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
     let deadline = Instant::now() + timeout;
     let mut child = command
         .stdin(Stdio::null())
