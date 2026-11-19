@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 base64 = "0.22"
-bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "1d74f71962cffcc7e9b2e76d9db643148a8d602e" }
+bitplane-protocol = { git = "https://github.com/bp-bitplane/bitplane-protocol", rev = "3370729287bbdf90e3b07654a35b5a5e56d3a986" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 libghostty-vt = "=0.2.2"
@@ -19,6 +19,7 @@ rustix = { version = "1", features = ["fs", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

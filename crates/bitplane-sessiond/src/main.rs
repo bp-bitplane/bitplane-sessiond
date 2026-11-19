@@ -9,6 +9,7 @@ use bitplane_sessiond::client::Client;
 use bitplane_sessiond::fs::Fs;
 use bitplane_sessiond::git::Git;
 use bitplane_sessiond::paths::Dirs;
+use bitplane_sessiond::plane::Plane;
 use bitplane_sessiond::server::{Config, serve};
 use bitplane_sessiond::session::Sessions;
 use bitplane_sessiond::{DAEMON_NAME, dev};
@@ -129,6 +130,7 @@ async fn serve_daemon(
             Agents::claude(std::env::current_exe()?),
             Fs::module(),
             Git::module(),
+            Plane::module(),
         ],
         env: None,
     };
