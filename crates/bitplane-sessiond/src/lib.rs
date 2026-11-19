@@ -7,6 +7,7 @@ pub mod env;
 pub mod fs;
 pub mod git;
 pub mod git_cli;
+pub mod job;
 pub mod module;
 pub mod paths;
 pub mod pidfile;

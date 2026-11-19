@@ -1,15 +1,16 @@
 //! The `plane` module: cc's sidebar model from `bp list`, the planes
 //! directory and its drafts, re-read when the planes directory changes, and
-//! any `bp` request passed through (ADR 0033). Every call is its own `bp`;
+//! any `bp` request passed through (ADR 0033), and the `plane.create` job
+//! kind (ADR 0034). Every call is its own `bp`;
 //! only the model's re-reads are coalesced, so they land in order.
 
 mod bp;
+mod create;
 mod model;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitplane_protocol::plane::{
     PlaneCreateDraftParams, PlaneDispatchParams, PlaneDispatchResult, PlaneInfo, PlaneListError,
@@ -28,6 +29,7 @@ use bp::{Bp, Failure};
 use model::{resolve_planes_dir, validate_plane_id};
 
 use crate::env::EnvMap;
+use crate::job::{Jobs, now_millis};
 use crate::module::{Availability, BoxFuture, Call, Events, Module, ModuleContext};
 use crate::watch::DEBOUNCE;
 
@@ -45,6 +47,7 @@ pub struct Plane {
 struct Shared {
     bp: Arc<Bp>,
     events: Events,
+    jobs: Arc<Jobs>,
     /// One permit means "list again"; notifications while a list runs
     /// coalesce into one more run.
     wake: Notify,
@@ -140,6 +143,7 @@ impl Module for Plane {
         let shared = Arc::new(Shared {
             bp,
             events: context.events,
+            jobs: context.jobs,
             wake: Notify::new(),
             state: Mutex::new(State {
                 model: PlanesModel {
@@ -192,6 +196,7 @@ impl Module for Plane {
                 method::PLANE_PROJECTS => self.projects().await,
                 method::PLANE_CREATE_DRAFT => self.create_draft(params(&call)?).await,
                 method::PLANE_DISPATCH => self.dispatch(params(&call)?).await,
+                method::PLANE_CREATE => create::start(self.shared(), &call, params(&call)?),
                 _ => Err(RpcError::new(
                     RpcError::METHOD_NOT_FOUND,
                     format!("no method {}", call.method),
@@ -292,12 +297,6 @@ fn make_draft(planes_dir: &std::path::Path, id: &str) -> Result<(), RpcError> {
         ),
         _ => failed(error, &dir),
     })
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 fn params<T: DeserializeOwned>(call: &Call) -> Result<T, RpcError> {

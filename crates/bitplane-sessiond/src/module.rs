@@ -9,12 +9,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use bitplane_protocol::job::JobClient;
 use bitplane_protocol::{Capability, ErrorCode, Frame, Id, Notification, Response, RpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::env::EnvMap;
+use crate::job::Jobs;
 use crate::paths::Dirs;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -109,6 +111,8 @@ pub struct Reply {
 pub struct Connection {
     pub id: u64,
     pub frames: mpsc::UnboundedSender<Frame>,
+    /// The `hello` client; set before any call is handled.
+    pub client: Option<JobClient>,
 }
 
 /// The agent session an agent terminal resumes, and where it started
@@ -153,6 +157,8 @@ pub struct ModuleContext {
     pub events: Events,
     pub bus: Bus,
     pub launchers: Launchers,
+    /// Root's job table, which the module's job kinds start jobs in.
+    pub jobs: Arc<Jobs>,
 }
 
 /// Broadcast events to every connection that completed `hello`.
@@ -174,6 +180,7 @@ const FRAME_OWNER: &str = "session";
 
 pub struct Registry {
     entries: Vec<Entry>,
+    jobs: Arc<Jobs>,
     shut_down: AtomicBool,
 }
 
@@ -267,6 +274,7 @@ impl Registry {
         dirs: &Dirs,
         env: Arc<EnvMap>,
         events: Events,
+        jobs: Arc<Jobs>,
     ) -> std::io::Result<Self> {
         let bus = Bus(broadcast::channel(256).0);
         let launchers = Launchers::default();
@@ -291,6 +299,7 @@ impl Registry {
                     events: events.clone(),
                     bus: bus.clone(),
                     launchers: launchers.clone(),
+                    jobs: jobs.clone(),
                 });
             }
             entries.push(Entry {
@@ -311,6 +320,7 @@ impl Registry {
         }
         Ok(Self {
             entries,
+            jobs,
             shut_down: Default::default(),
         })
     }
@@ -367,7 +377,12 @@ impl Registry {
         }
     }
 
+    pub fn jobs(&self) -> &Arc<Jobs> {
+        &self.jobs
+    }
+
     pub fn disconnected(&self, connection: u64) {
+        self.jobs.disconnected(connection);
         for entry in &self.entries {
             if let Availability::Available { .. } = entry.availability {
                 entry.module.disconnected(connection);
@@ -376,9 +391,9 @@ impl Registry {
     }
 
     /// Every available module's [`Module::shutdown`], then every one's
-    /// [`Module::terminate`], once; later calls do nothing. Sessions persist
-    /// the agent links before the agent module stops taking hooks, and only
-    /// then are the PTYs hung up (ADR 0031).
+    /// [`Module::terminate`], once, and the job table's last save; later
+    /// calls do nothing. Sessions persist the agent links before the agent
+    /// module stops taking hooks, and only then are the PTYs hung up (ADR 0031).
     pub fn shutdown(&self, restore: bool) {
         if self.shut_down.swap(true, Ordering::SeqCst) {
             return;
@@ -394,6 +409,7 @@ impl Registry {
         for entry in available() {
             entry.module.terminate(restore);
         }
+        self.jobs.close();
     }
 
     /// The module with the longest namespace that prefixes `method`.

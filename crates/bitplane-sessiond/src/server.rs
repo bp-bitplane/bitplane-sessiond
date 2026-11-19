@@ -10,6 +10,7 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::connection::{Shared, serve_connection};
 use crate::env::{self, EnvMap};
+use crate::job::Jobs;
 use crate::module::{Events, Module, Registry};
 use crate::paths::Dirs;
 use crate::pidfile::{Pidfile, PidfileError};
@@ -83,7 +84,8 @@ pub async fn serve(config: Config, shutdown: impl Future<Output = ()>) -> Result
     };
 
     let events = broadcast::channel(1024).0;
-    let registry = Registry::start(modules, &dirs, Arc::new(env), Events(events.clone()))?;
+    let jobs = Jobs::load(&dirs, Events(events.clone()));
+    let registry = Registry::start(modules, &dirs, Arc::new(env), Events(events.clone()), jobs)?;
     let daemon = DaemonInfo {
         name: DAEMON_NAME.into(),
         version: DAEMON_VERSION.into(),
