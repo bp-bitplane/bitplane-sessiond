@@ -9,7 +9,7 @@ A Claude terminal's **agent link** (agent session + cwd) is persisted state (ADR
 
 **`SessionEnd` never touches the link.** Claude Code runs `SessionEnd` whenever its PTY hangs up, whatever the cause: a daemon stopping, a quit, a reboot (cc#43 saw it on every quit path). Its reasons (`clear`, `resume`, `logout`, `prompt_input_exit`, `other`) do not tell those apart from the user typing `/exit`. `SessionEnd` only ends the live agent.
 
-**The link changes only on a new `SessionStart`** of the `claude` that is the session's PTY child. So `/clear`, `/branch`, an in-session `/resume` and `--fork-session` move the link to the new agent session (and the old Agent gets `agent.removed`). `compact` reports the same id, so it changes nothing. A nested `claude -p` never moves it: it is launched without the session's `--settings`, so it gets no hooks (ADR 0029).
+**The link changes only on a new `SessionStart`** of the `claude` that is the session's PTY child. So `/clear`, `/branch`, an in-session `/resume` and `--fork-session` move the link to the new agent session (and the old Agent gets `agent.removed`). `compact` reports the same id, so it changes nothing. A nested `claude -p` never moves it: it is launched without the session's `--settings`, so it gets no hooks (ADR 0029). Neither does `/fork`'s background copy, whose hooks come from another process (ADR 0029).
 
 **Only `session.close` clears the link.** `claude` exiting, for `/exit`, a crash or `/bg`, leaves the session `exited` with its link kept, so the exited tab can resume the conversation and `session.restart` relaunches it with `--resume`. Restore brings an exited Claude terminal back exited (ADR 0027), so keeping the link never undoes an `/exit`.
 

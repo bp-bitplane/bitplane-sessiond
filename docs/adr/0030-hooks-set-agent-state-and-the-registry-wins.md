@@ -31,5 +31,6 @@ Each tracked agent has a live `state` (`idle | busy | waiting{reason} | resuming
 
 - A hook edge can be reversed by the next poll when the registry has not caught up yet; the ~3 s poll keeps that window short, and the hook usually agrees.
 - An idle host with live agents still runs `claude agents --json` every ~30 s.
+- A turn started from `!` bash mode, where Claude replies to the command's output, fires no `UserPromptSubmit`, only its `Stop` (checked on 2.1.326), so it shows no `busy` unless a ~30 s poll lands in it. Such turns are short, and polling idle agents every ~3 s to catch them is not worth it.
 - No cost is shown in v1: the only live source would replace the user's status line.
 - Decision: [Agent adapter interface and wiring](https://github.com/bp-bitplane/bitplane-sessiond/issues/5), items 4–7, reworked by [Claude terminals](https://github.com/bp-bitplane/bitplane-sessiond/issues/50).
