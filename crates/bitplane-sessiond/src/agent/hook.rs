@@ -25,6 +25,9 @@ const MAX_MESSAGE: u64 = 8 << 20;
 pub struct Message {
     pub session: String,
     pub token: String,
+    /// The process that ran the hook: which `claude` sent it.
+    #[serde(default)]
+    pub parent: Option<u32>,
     pub payload: Value,
 }
 
@@ -48,6 +51,7 @@ pub fn forward() {
     let message = serde_json::to_vec(&Message {
         session,
         token,
+        parent: Some(std::os::unix::process::parent_id()),
         payload,
     })
     .expect("hook messages serialize");

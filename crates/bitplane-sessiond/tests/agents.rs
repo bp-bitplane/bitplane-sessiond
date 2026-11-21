@@ -42,6 +42,8 @@ const GRACE: Duration = Duration::from_millis(500);
 /// one takes a while; while `$FAKE_CLAUDE_LOG/resume-fails` exists it
 /// instead waits that many seconds and quits without a `SessionStart`.
 /// `sessionend` runs the `SessionEnd` hook without quitting, as a hang-up does.
+/// `bgfork <id>` sends that agent session's `SessionStart` from two
+/// processes down, as `/fork`'s background copy does.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 log="$FAKE_CLAUDE_LOG"
 if [ "$1" = agents ] && [ "$2" = --json ]; then
@@ -151,6 +153,7 @@ while IFS= read -r line; do
     bg)
       rm -f "$entry"
       printf '{"pid":1,"id":"bg1","cwd":"%s","kind":"background","startedAt":1,"sessionId":"%s","status":"idle","state":"running"}' "$PWD" "$sid" > "$log/registry/bg.json" ;;
+    bgfork) ( ( sid="$2"; emit SessionStart ',"source":"fork"'; true ); true ) ;;
     nested) claude -p nested ;;
     quit) exit 0 ;;
   esac
@@ -279,6 +282,26 @@ async fn a_nested_claude_gets_no_hooks_and_never_takes_the_agent() {
     let calls = fixture.calls();
     let nested = calls.lines().find(|call| call.starts_with("-p")).unwrap();
     assert!(!nested.contains("--settings"), "{calls}");
+}
+
+#[tokio::test]
+async fn a_background_fork_never_takes_the_terminals_agent() {
+    let mut fixture = Fixture::start().await;
+    let (id, mut screen) = fixture.claude_terminal(json!({})).await;
+    fixture.say(&mut screen, "start a1 startup").await;
+    fixture.changed().await;
+
+    fixture.say(&mut screen, "bgfork f1").await;
+    fixture.say(&mut screen, "prompt").await;
+
+    let agent = fixture.changed().await;
+    assert_eq!(
+        (&agent["agentSession"], &agent["session"], &agent["state"]),
+        (&json!("a1"), &json!(id), &json!({ "kind": "busy" }))
+    );
+    let listed = fixture.list().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["agentSession"], "a1");
 }
 
 #[tokio::test]

@@ -537,6 +537,14 @@ impl Shared {
             tracing::debug!(session = %message.session, "dropped a hook with a wrong session or token");
             return;
         }
+        let child = state
+            .processes
+            .get(&message.session)
+            .and_then(|processes| processes.shell);
+        if !sent_by(child, message.parent) {
+            tracing::debug!(session = %message.session, "dropped a hook from another claude than the session's");
+            return;
+        }
         state.hooked.insert(message.session.clone(), Instant::now());
         let Some(Ingested {
             agent_session,
@@ -756,6 +764,16 @@ async fn follow_sessions(bus: Bus, shared: Weak<Shared>) {
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+/// Whether the session's PTY child, the terminal's own `claude`, ran the
+/// hook, directly or through one shell. A `/fork` copy inherits the hook env
+/// but runs deeper, in Claude Code's background host (ADR 0029).
+fn sent_by(child: Option<u32>, parent: Option<u32>) -> bool {
+    match (child, parent) {
+        (Some(child), Some(parent)) => parent == child || process::parent(parent) == Some(child),
+        _ => true,
     }
 }
 
