@@ -43,8 +43,12 @@ The long-lived `bitplane-sessiond` of a host; it owns that host's sessions and j
 _Avoid_: Host agent, server, per-user daemon, sessiond (when meaning the running process)
 
 **Daemon instance**:
-One running `bitplane-sessiond` process of one protocol version; after an update the old instance drains while the new one takes over.
+One running `bitplane-sessiond` process of one protocol version; after an update the old instance hands its sessions over to the new one and exits.
 _Avoid_: Daemon (when meaning one version's process), versioned daemon
+
+**Daemon restart**:
+Stopping the session daemon on request so a new daemon instance starts and restores every session; it is how saved settings and newly installed tools take effect.
+_Avoid_: Restart (alone; that is restarting an exited session), reload
 
 **Module**:
 A part of the daemon that owns one namespace of protocol methods and events, such as `session` or `agent.claude`; a host may lack one, and the client is told at hello. The root module owns the methods with no namespace.
@@ -240,8 +244,8 @@ A session whose shell ended with an error or never started; its tab stays open s
 _Avoid_: Dead session, crashed tab
 
 **Restore**:
-Reopening, on launch, the tabs that were open when cc last stopped, each with a fresh shell in its plane and its agent session resumed.
-_Avoid_: Reattach (a reload reattaches to running sessions), persist
+Bringing the sessions back after the session daemon itself restarted, each with a fresh shell in its plane and its agent session resumed.
+_Avoid_: Reattach (relaunching cc or reloading reattaches to the running sessions, with a snapshot), persist
 
 **Sidebar**:
 The resizable plane list on the left edge of cc, where planes and their tabs are picked.
