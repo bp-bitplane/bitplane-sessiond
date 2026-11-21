@@ -75,7 +75,7 @@ pub fn failure(output: &Output) -> String {
     }
 }
 
-fn no_prompts(env: &EnvMap) -> EnvMap {
+pub(crate) fn no_prompts(env: &EnvMap) -> EnvMap {
     let mut env = env.clone();
     env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
     let ssh = match env.get("GIT_SSH_COMMAND").filter(|s| !s.trim().is_empty()) {
