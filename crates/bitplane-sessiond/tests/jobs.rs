@@ -17,8 +17,9 @@ const WAIT: Duration = Duration::from_secs(10);
 
 /// `bp list` answers no planes. `plane_create` writes `$FAKE_BP/progress`
 /// to fd 3, `log` and `lines` (that many numbered lines) to stderr, waits
-/// while `hold` exists, then writes `progress.after` and `log.after`; a
-/// SIGINT answers `interrupted.stdout`. Then any action answers from
+/// while `hold` exists (or, with `script`, runs a child script until SIGINT
+/// reaches it), then writes `progress.after` and `log.after`; a SIGINT
+/// answers `interrupted.stdout`. Then any action answers from
 /// `<action>.{stderr,stdout,exit}`.
 const FAKE_BP: &str = r#"#!/bin/sh
 case " $* " in
@@ -37,6 +38,7 @@ if [ "$action" = plane_create ]; then
 	[ -f "$FAKE_BP/lines" ] && seq 1 "$(cat "$FAKE_BP/lines")" >&2
 	[ -f "$FAKE_BP/progress" ] && cat "$FAKE_BP/progress" >&3
 	while [ -f "$FAKE_BP/hold" ]; do sleep 0.05; done
+	[ -f "$FAKE_BP/script" ] && sh -c 'trap "touch \"$FAKE_BP/script.interrupted\"; exit 130" INT; while :; do sleep 0.05; done'
 	[ -f "$FAKE_BP/progress.after" ] && cat "$FAKE_BP/progress.after" >&3
 	[ -f "$FAKE_BP/log.after" ] && cat "$FAKE_BP/log.after" >&2
 fi
@@ -457,6 +459,35 @@ async fn any_client_cancels_and_dismisses_and_the_errors_say_why_not() {
         job,
         "a dismissed job gets job.removed at once"
     );
+}
+
+#[tokio::test]
+async fn a_cancel_during_scripts_reaches_the_script_and_a_kept_plane_succeeded() {
+    let fake = Fake::new();
+    fake.set("script", "");
+    fake.set("progress", &progress(&[("@api", "script", "started")]));
+    let kept = json!({"member": "@api", "outcome": "ok",
+        "detail": {"branch": "feat", "created_branch": true, "path": "api", "unwound": false}});
+    fake.set(
+        "interrupted.stdout",
+        &json!({"action": "plane_create", "id": "auth", "directory": fake.planes.join("auth"),
+                "members": [kept], "interrupted": true, "remnant": false, "scripts": []})
+        .to_string(),
+    );
+    let daemon = fake.start().await;
+    let mut client = daemon.connect_hello().await;
+    let id = create(&client, "auth").await;
+    changed_until(&mut client, &id, |job| job["phase"] == "runningScripts").await;
+
+    client
+        .call("job.cancel", Some(json!({ "job": id })))
+        .await
+        .unwrap();
+    let done = finished(&mut client, &id).await;
+
+    assert!(fake.control.join("script.interrupted").exists());
+    assert_eq!(done["status"], json!({"state": "succeeded"}));
+    assert_eq!(done["detail"]["response"]["interrupted"], true);
 }
 
 #[tokio::test]
