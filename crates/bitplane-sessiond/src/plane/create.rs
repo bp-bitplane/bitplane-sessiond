@@ -54,9 +54,11 @@ pub(super) fn start(
         json!(detail),
         Box::new(move || {
             if let Some(pid) = pid {
-                // SAFETY: kill(2) on our own child, which root only cancels while running.
+                // bp is a session leader (setsid) and expects Ctrl-C's reach: its
+                // scripts get the SIGINT too, or a cancel waits them out.
+                // SAFETY: kill(2) on our own child's group, which root only cancels while running.
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGINT);
+                    libc::kill(-(pid as libc::pid_t), libc::SIGINT);
                 }
             }
         }),
@@ -191,6 +193,25 @@ fn outcome(
         interrupted: bool,
         #[serde(default)]
         remnant: bool,
+        #[serde(default)]
+        members: Vec<Row>,
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        outcome: String,
+        #[serde(default)]
+        detail: Option<Value>,
+    }
+    impl Row {
+        fn kept(&self) -> bool {
+            self.outcome == "ok"
+                && self
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("unwound"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+        }
     }
     // An interrupted create answers on stdout with a non-zero exit.
     if let Ok(response) = serde_json::from_slice::<Value>(stdout)
@@ -199,10 +220,13 @@ fn outcome(
         detail.plane = Some(created.id);
         detail.directory = created.directory;
         detail.response = Some(response);
+        // An interrupt past bp's point of no return (during scripts) keeps the
+        // plane: interrupted, no remnant, and members that were never unwound.
+        let kept = created.members.iter().any(Row::kept);
         return match (created.remnant, created.interrupted) {
             (true, _) => JobStatus::Partial,
-            (false, true) => JobStatus::NothingCreated,
-            (false, false) => JobStatus::Succeeded,
+            (false, true) if !kept => JobStatus::NothingCreated,
+            (false, _) => JobStatus::Succeeded,
         };
     }
     let (_, envelope) = bp::split_envelope(stderr);
@@ -256,6 +280,15 @@ mod tests {
                    "members": [], "interrupted": interrupted, "remnant": remnant, "scripts": []})
             .to_string()
         };
+        let member = |unwound: bool| {
+            json!({"member": "@api", "outcome": "ok",
+                   "detail": {"branch": "auth", "created_branch": true, "path": "api", "unwound": unwound}})
+        };
+        let interrupted_with = |members: Vec<Value>| {
+            json!({"action": "plane_create", "id": "auth", "directory": "/p/auth",
+                   "members": members, "interrupted": true, "remnant": false, "scripts": []})
+            .to_string()
+        };
 
         let (status, detail) = judged(Some(0), &created(false, false), "");
         assert_eq!(status, JobStatus::Succeeded);
@@ -269,6 +302,20 @@ mod tests {
         assert_eq!(
             judged(Some(130), &created(true, true), "").0,
             JobStatus::Partial
+        );
+        assert_eq!(
+            judged(Some(130), &interrupted_with(vec![member(true)]), "").0,
+            JobStatus::NothingCreated
+        );
+        let skipped = json!({"member": "@web", "outcome": "skipped", "detail": "interrupted"});
+        assert_eq!(
+            judged(
+                Some(130),
+                &interrupted_with(vec![member(false), skipped]),
+                ""
+            )
+            .0,
+            JobStatus::Succeeded
         );
     }
 
