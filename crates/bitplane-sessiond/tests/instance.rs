@@ -88,11 +88,12 @@ async fn the_serve_binary_answers_hello() {
         .unwrap();
 
     assert_eq!(hello.daemon.name, "bitplane-sessiond");
-    let modules: Vec<(&str, bool)> = hello
+    let modules: Vec<&str> = hello
         .capabilities
         .iter()
-        .map(|capability| (capability.module.as_str(), capability.available))
+        .map(|capability| capability.module.as_str())
         .collect();
-    assert_eq!(modules, [("session", true)]);
+    assert_eq!(modules, ["session", "agent"]);
+    assert!(hello.capabilities[0].available);
     child.start_kill().unwrap();
 }

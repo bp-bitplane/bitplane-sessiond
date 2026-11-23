@@ -1,0 +1,279 @@
+//! The registry poll (ADR 0030): while any agent works, or runs without
+//! hooks, the agent's own registry is read and wins over the hooks; while
+//! any agent is live at all, it is read now and then to see `/bg`.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
+use std::time::Instant;
+
+use bitplane_protocol::agent::{Agent, AgentState, Tracking};
+use bitplane_protocol::session::SessionId;
+use tokio::sync::Notify;
+
+use super::{LiveAgent, Processes, Shared, State, Terminal, process};
+use crate::module::AgentLink;
+
+/// Probes whenever [`Shared::next_probe`] says so, until the module is gone.
+pub(super) async fn run(shared: Weak<Shared>, wake: Arc<Notify>) {
+    loop {
+        let Some(due) = shared.upgrade().map(|shared| shared.next_probe()) else {
+            return;
+        };
+        match due {
+            Some(due) => {
+                tokio::select! {
+                    () = tokio::time::sleep_until(due.into()) => {}
+                    () = wake.notified() => continue,
+                }
+            }
+            None => {
+                wake.notified().await;
+                continue;
+            }
+        }
+        let Some((adapter, env, processes)) = shared.upgrade().map(|shared| {
+            let mut state = shared.state.lock().unwrap();
+            state.last_probe = Some(Instant::now());
+            (
+                shared.adapter.clone(),
+                shared.env.clone(),
+                state
+                    .terminals
+                    .iter()
+                    .map(|(session, terminal)| (session.clone(), terminal.processes.clone()))
+                    .collect(),
+            )
+        }) else {
+            return;
+        };
+        let snapshot = Instant::now();
+        let probed = tokio::task::spawn_blocking(move || {
+            adapter
+                .probe(&env)
+                .map(|live| (join(&live, &processes), live))
+        })
+        .await;
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        match probed {
+            Ok(Some((joined, live))) => shared.apply(&live, &joined, snapshot),
+            Ok(None) => tracing::debug!("couldn't read the agent registry"),
+            Err(error) => tracing::warn!(%error, "the agent registry probe failed"),
+        }
+    }
+}
+
+/// Each session's interactive registry entries, by index into the probe.
+type Joined = HashMap<SessionId, Vec<usize>>;
+
+impl Shared {
+    /// When the registry is next read: one poll interval after the last
+    /// read while any agent is busy, waiting or tracked by poll, one live
+    /// interval after it while any agent is live, and when a candidate
+    /// falls due; `None` with no live agent and no candidate.
+    fn next_probe(&self) -> Option<Instant> {
+        let state = self.state.lock().unwrap();
+        let after = |interval| {
+            state
+                .last_probe
+                .map_or_else(Instant::now, |last| last + interval)
+        };
+        let live = state.agents.iter().filter(|tracked| {
+            tracked.agent.session.is_some() && tracked.agent.state != AgentState::Exited
+        });
+        let working = live.clone().any(|tracked| {
+            matches!(
+                tracked.agent.state,
+                AgentState::Busy | AgentState::Waiting { .. }
+            ) || tracked.agent.tracking == Tracking::Poll
+        });
+        let polled = if working {
+            Some(after(self.timing.poll))
+        } else if live.clone().next().is_some() {
+            Some(after(self.timing.live))
+        } else {
+            None
+        };
+        let candidate = state
+            .terminals
+            .values()
+            .filter_map(|terminal| terminal.candidate)
+            .map(|candidate| candidate.due.max(after(self.timing.poll)))
+            .min();
+        match (polled, candidate) {
+            (Some(polled), Some(candidate)) => Some(polled.min(candidate)),
+            (polled, candidate) => polled.or(candidate),
+        }
+    }
+
+    /// Applies a registry read that started at `snapshot`. A hook handled
+    /// since is newer than the read, so it keeps its session's state.
+    fn apply(&self, live: &[LiveAgent], joined: &Joined, snapshot: Instant) {
+        let mut state = self.state.lock().unwrap();
+        let state = &mut *state;
+        let none = Vec::new();
+        let mut restarted = Vec::new();
+        for tracked in state.agents.iter_mut() {
+            let Some(session) = tracked.agent.session.clone() else {
+                continue;
+            };
+            if tracked.agent.state == AgentState::Exited {
+                continue;
+            }
+            let id = tracked.agent.agent_session.clone();
+            let entries: Vec<&LiveAgent> = joined
+                .get(&session)
+                .unwrap_or(&none)
+                .iter()
+                .map(|&index| &live[index])
+                .collect();
+            if live
+                .iter()
+                .any(|entry| entry.background && entry.agent_session.as_ref() == Some(&id))
+            {
+                self.change(tracked, |agent| agent.state = AgentState::Exited);
+                continue;
+            }
+            let terminal = state.terminals.get(&session);
+            let child = terminal.and_then(|terminal| terminal.processes.shell);
+            let vanished = tracked
+                .pid
+                .is_some_and(|pid| !child.is_some_and(|child| process::descends_from(pid, child)));
+            if vanished {
+                self.change(tracked, |agent| agent.state = AgentState::Exited);
+                continue;
+            }
+            if terminal.is_some_and(|terminal| terminal.candidate.is_some()) {
+                continue;
+            }
+            let entry = entries
+                .iter()
+                .find(|entry| entry.agent_session.as_ref() == Some(&id))
+                .or_else(|| {
+                    let pid = tracked.pid?;
+                    entries.iter().find(|entry| entry.pid == pid)
+                });
+            let Some(entry) = entry else {
+                continue;
+            };
+            tracked.pid = Some(entry.pid);
+            if tracked.agent.tracking == Tracking::Poll
+                && entry
+                    .agent_session
+                    .as_ref()
+                    .is_some_and(|other| *other != id)
+            {
+                restarted.push((session, (*entry).clone()));
+                continue;
+            }
+            let fresh_hook = terminal.is_some_and(|terminal| terminal.hooked_since(snapshot));
+            self.change(tracked, |agent| {
+                if entry.name.is_some() {
+                    agent.name.clone_from(&entry.name);
+                }
+                if let Some(registry) = entry.state.clone().filter(|_| !fresh_hook) {
+                    agent.state = registry;
+                }
+            });
+        }
+        for (session, entry) in restarted {
+            self.adopt(state, session, &entry);
+        }
+        self.check_candidates(state, live, joined, snapshot);
+    }
+
+    /// Lists the registry's agent in each due candidate session with
+    /// `tracking: poll`, a resumed one included. The candidate stays until
+    /// then: the session's PTY child is the agent, and its exit drops it.
+    fn check_candidates(
+        &self,
+        state: &mut State,
+        live: &[LiveAgent],
+        joined: &Joined,
+        snapshot: Instant,
+    ) {
+        let due: Vec<(SessionId, Processes)> = state
+            .terminals
+            .iter()
+            .filter(|(_, terminal)| {
+                terminal
+                    .candidate
+                    .is_some_and(|candidate| candidate.due <= snapshot)
+                    && !terminal.hooked_since(snapshot)
+            })
+            .map(|(session, terminal)| (session.clone(), terminal.processes.clone()))
+            .collect();
+        for (session, processes) in due {
+            let entries: Vec<&LiveAgent> = joined
+                .get(&session)
+                .into_iter()
+                .flatten()
+                .map(|&index| &live[index])
+                .collect();
+            let entry = entries
+                .iter()
+                .find(|entry| Some(entry.pid) == processes.group)
+                .or(entries.first());
+            if let Some(entry) = entry.filter(|entry| entry.agent_session.is_some()) {
+                let entry = (*entry).clone();
+                self.adopt(state, session, &entry);
+            }
+        }
+    }
+
+    /// `entry` becomes its session's agent, tracked by the registry alone.
+    /// With no `SessionStart` to follow, the link follows the registry's id
+    /// (ADR 0031).
+    fn adopt(&self, state: &mut State, session: SessionId, entry: &LiveAgent) {
+        let Some(agent_session) = entry.agent_session.clone() else {
+            return;
+        };
+        if let Some(terminal) = state.terminals.get_mut(&session) {
+            terminal.candidate = None;
+        }
+        let link = AgentLink {
+            agent_session: agent_session.clone(),
+            cwd: entry.cwd.clone(),
+        };
+        let agent = Agent {
+            name: entry.name.clone(),
+            ..self.new_agent(
+                &session,
+                agent_session,
+                entry.cwd.clone(),
+                entry.state.clone().unwrap_or(AgentState::Idle),
+                Tracking::Poll,
+            )
+        };
+        self.start_agent(state, agent, Some(entry.pid));
+        self.link(state, &session, link);
+    }
+}
+
+/// Interactive entries to the agent terminal whose PTY child they run under.
+fn join(live: &[LiveAgent], processes: &HashMap<SessionId, Processes>) -> Joined {
+    let mut joined = Joined::new();
+    for (index, entry) in live.iter().enumerate() {
+        if entry.background {
+            continue;
+        }
+        let session = processes.iter().find(|(_, processes)| {
+            processes
+                .shell
+                .is_some_and(|shell| process::descends_from(entry.pid, shell))
+        });
+        if let Some((session, _)) = session {
+            joined.entry(session.clone()).or_default().push(index);
+        }
+    }
+    joined
+}
+
+impl Terminal {
+    /// Whether a hook was handled since a registry read began at `snapshot`,
+    /// so the hook is the newer word.
+    fn hooked_since(&self, snapshot: Instant) -> bool {
+        self.hooked.is_some_and(|hooked| hooked >= snapshot)
+    }
+}

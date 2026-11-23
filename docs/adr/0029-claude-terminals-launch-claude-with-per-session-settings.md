@@ -1,0 +1,50 @@
+---
+status: accepted
+date: 2026-11-09
+---
+
+# Claude terminals launch `claude` with per-session `--settings`
+
+The `agent` module (ADR 0023), through its `claude` kind, tracks Claude Code agents in **agent terminals** of that kind, Claude terminals for short, and only there, without touching the user's Claude Code configuration. Every Claude Code fact below was checked against `claude` 2.1.318 and the official docs.
+
+**An agent terminal runs its agent, here `claude`, as the PTY child, with no shell.** `session.open { …, agent?: { kind, resume? } }` opens one; without `agent` the session is a regular terminal running the login shell, and gets no agent env, no token and no `PATH` change. `Session.agent?: { kind }` tells the two apart. The PTY child exiting is `claude` exiting, so the session becomes `exited { code }`. A `claude` the user starts by hand in a regular terminal is not tracked: no state, no link, no restore.
+
+**Launch.** The daemon runs `claude --settings <per-session hooks file> [--resume <id>]` with the captured login-shell env (ADR 0022) plus `BITPLANE_SESSION_ID` and the session's hook token. The binary is resolved on that captured `PATH` on every launch and every `agent.list`, never on a session's own `env`, so installing or removing `claude` shows up without a daemon restart, and one session's `PATH` cannot change the kind's availability for everyone. Every launch failure, an unknown kind or a missing binary, is `spawnFailed { error }`: the session is still created and persisted, and `session.restart` launches it once the cause is fixed. `claude` starts in the first of: the `cwd` given to `session.open`, the cwd of an agent session the daemon knows (on resume), the session root; a given `cwd` wins even over a known one and may lie outside the root. The link records the cwd used, and later launches start there. A cwd that is not a directory is a launch failure like any other, with the link kept, since `claude --resume` continues a conversation from any directory and would otherwise silently work in the wrong place. M1 passes no other arguments; users switch model and mode with in-session commands. `--settings` sits above the user, project and local settings files, and Claude Code merges hook lists across those levels, so the user's own hooks keep running. Nothing is installed globally: `~/.claude/settings.json` is never written.
+
+**The adapter interface.** The module talks to Claude Code only through one internal trait, so a second agent kind is a second adapter, not a fork of the module:
+
+```text
+trait AgentAdapter {
+  kind() -> "claude"
+  resolve(env) -> Result<binary, error>                 // env is the captured one
+  hooks(command) -> settings                            // every hook runs command, the forwarder
+  launch(binary, hooks_file, link?) -> { argv, env }    // --settings, --resume
+  ingest(hook_payload) -> Option<{ agentSession, event: AgentEvent }>
+  probe(env) -> Option<Vec<LiveAgent { pid, agentSession?, name?, cwd, state?, background }>>
+}
+AgentEvent = Started{cwd, source} | Busy | Waiting{reason} | Idle{error?} | Ended
+```
+
+The module writes each session's hooks file from `hooks` and adds the hook channel's env (`BITPLANE_SESSION_ID`, the token, the socket) on top of what `launch` returns, so an adapter never sees a token. `LiveAgent.agentSession` is optional because `claude agents --json` reports `sessionId` only when set, and `probe` gives `None` when the registry can't be read. Registry entries are joined to sessions by pid through the PTY process tree, whose root is now `claude` itself. Daemon behaviour is tested through a real daemon that launches a fake `claude` from the captured `PATH`, which asserts its argv, never by calling the adapter from the module side; the adapter's pure translations (the argv, the hooks file, hook payloads and the registry's JSON) have their own unit tests.
+
+**Hook channel.** Every hook is a `command` hook running `bitplane-sessiond hook`, which forwards its stdin over a dedicated **hook channel**, `hook.sock` in the instance's runtime dir, not the client protocol (ADR 0024). The socket is owner-only (0600) in an owner-only (0700) dir: the same trust model as the client socket, everything running as the user is trusted. Unlike the client socket there is no peer-uid check, because macOS cannot report the uid of a hook process that has already exited, and the file modes already keep other users out. The forwarder carries `BITPLANE_SESSION_ID` and the per-session token; the token routes an event to its session and keeps a stray or stale hook from landing on the wrong one, it does not authenticate the user. A hook with a wrong token or session id is dropped. The forwarder also sends the pid of the process that ran it and of that process's parent, both read as it starts, and a hook is dropped unless the first is the session's PTY child, or the second is, for a shell right under it. The forwarder reads the grandparent itself because a non-exec `sh -c` may have exited by the time the daemon has read the message; a message from an older forwarder, without it, is checked by looking the parent up. The check exists because `/fork` (Claude Code 2.1.326) copies the conversation into a background `claude` that inherits the hook env, but runs under Claude Code's own background host, deeper in the tree. Its `SessionStart` must not read as the terminal's agent changing id, while `/branch`, which sends the same `source: fork` from the terminal's own `claude`, must. The forwarder is fire-and-forget with a short timeout and always exits 0: it never stalls a turn, and stays well inside the 1.5 s budget Claude Code gives all `SessionEnd` hooks together.
+
+**Identity comes from `SessionStart`.** The agent session id is the `session_id` of each `SessionStart` (sources `startup`, `resume`, `clear`, `compact`, `fork`); `--session-id` is not used.
+
+## Considered Options
+
+- **A `claude` wrapper on each session's `PATH`** (a multi-call `bitplane-sessiond` symlinked as `claude` in a daemon-owned dir, which `exec`ed the next `claude` with a generated `--settings`, skipped under `CLAUDECODE=1`). Rejected after it shipped on the branch: on macOS `/etc/zprofile` runs `path_helper`, which puts the system paths, `/opt/homebrew/bin` among them, ahead of everything already on `PATH`, so a login shell found the real `claude` first and the wrapper was bypassed on an ordinary Mac. It also had to merge a user's own `--settings` (the flag takes one value) and tracked a `claude` typed into any session, nested or not.
+- **Typing `claude` into a login shell in the session.** Rejected: exit and resume depend on who holds the PTY foreground, a resume typed into the shell races the rc files, and an exited agent leaves a shell that looks like a live session.
+- **A global hook install guarded by an env var** (cc's `BITPLANE_CC` hooks in `~/.claude/settings.json`). Rejected: it edits a file the user owns, runs in every Claude Code on the host, and needs a migration whenever the hook changes.
+- **A shell function or alias for `claude`.** Rejected: shell-specific, and invisible to anything that `exec`s `claude` without an interactive shell.
+- **A separate `CLAUDE_CONFIG_DIR` per session.** Rejected: it relocates the user's whole Claude Code state (credentials, history, plugins), not just the hooks.
+- **`http` hooks.** Rejected: the daemon would need a TCP listener, which a host may forbid, and an `allowedHttpHookUrls` allowlist at any settings level silently drops them.
+- **Choosing the id up front with `--session-id`.** Rejected: `/clear`, `/branch`, in-session `/resume` and `--fork-session` change the id anyway, and only `SessionStart` reports the new one.
+- **Hooks over the client protocol.** Rejected: a hook would need a `hello` per event, and session-scoped tokens have no place in the client protocol.
+
+## Consequences
+
+- `disableAllHooks` or `allowManagedHooksOnly` in the user's or the organization's settings keeps the hooks from loading. Then no `SessionStart` arrives and tracking falls back to the registry (ADR 0030).
+- A nested `claude -p` run by an agent inherits the env but not the `--settings` flag, so it gets no hooks and can never take the session's agent link (ADR 0031).
+- Resume is the same launch with `--resume <id>`, so the hooks are injected again without a special path.
+- Decision: [Agent adapter interface and wiring](https://github.com/bp-bitplane/bitplane-sessiond/issues/5), items 1–3 and 10, reworked by [Claude terminals](https://github.com/bp-bitplane/bitplane-sessiond/issues/50).
